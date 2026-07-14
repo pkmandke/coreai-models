@@ -178,9 +178,7 @@ async def _async_export_model(config: ExportConfig) -> str:
 
     logger.info(f"Loading {config.hf_model_id} ({config.variant}, dtype={target_dtype})...")
 
-    # Both variants load weights layer-by-layer (mmap-backed) and disk-checkpoint
-    # the compressor: macOS streams through quantization, iOS through palettization
-    # (both finalize with mmap_dir on the CoreAI backend).
+    # Both variants load weights layer-by-layer (mmap-backed).
     with tempfile.TemporaryDirectory(prefix="coreai_export_") as temp_dir:
         layer_mmap_dir = os.path.join(temp_dir, "layers")
         os.makedirs(layer_mmap_dir, exist_ok=True)

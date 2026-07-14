@@ -257,6 +257,13 @@ class Qwen2ForCausalLMForiOS(BaseForCausalLMForiOS):
         )
 
     def _mutate_state_dict(self, state_dict: dict[str, torch.Tensor]) -> None:
+        """Rewrite HF weight keys into the iOS module layout, in place.
+
+        Called repeatedly on partial state_dicts: the full dict, one
+        single-layer slice at a time, and a shared-params-only slice
+        (embeddings / lm_head). Handles any subset of keys and does not assume
+        all layers are present.
+        """
         present_layers = set()
         for k in state_dict:
             name_split = k.split(".")
@@ -266,11 +273,9 @@ class Qwen2ForCausalLMForiOS(BaseForCausalLMForiOS):
                 continue
             present_layers.add(int(name_split[2]))
 
-        # This method runs on the full dict, on one per-layer slice at a time, and
-        # (unlike the macOS models) on the shared-params slice. Iterate only the
-        # layers actually present, and access each layer's keys unconditionally so
-        # a malformed layer fails loudly rather than being silently skipped. A
-        # layer-less slice is valid only when it carries shared params.
+        # Access present layers' keys unconditionally so a malformed layer fails
+        # loudly instead of being silently skipped; a layer-less slice is valid
+        # only if it carries shared params.
         has_shared_keys = (
             "model.embed_tokens.weight" in state_dict or "lm_head.weight" in state_dict
         )
