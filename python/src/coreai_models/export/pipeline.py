@@ -61,6 +61,8 @@ class ExportConfig:
     output_name: str | None = None
     num_layers: int | None = None
     overwrite: bool = False
+    # iOS only. When True, embedding table is not quantized to int8.
+    disable_embedding_quantization: bool = False
     # Optional prebuilt coreai-opt config (KMeansPalettizerConfig or
     # QuantizerConfig) loaded from a user-provided YAML. When set, the pipeline
     # uses this directly and ignores `compression` for config resolution
