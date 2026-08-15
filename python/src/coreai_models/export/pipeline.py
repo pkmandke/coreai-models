@@ -194,6 +194,7 @@ async def _async_export_model(config: ExportConfig) -> str:
             num_layers=config.num_layers,
             hf_config_attr=entry.hf_config_attr,
             hf_state_dict_prefix=entry.hf_state_dict_prefix,
+            disable_embedding_quantization=config.disable_embedding_quantization,
         )
         model = model.eval()
         # ---- 3. Resolve compression preset ----
