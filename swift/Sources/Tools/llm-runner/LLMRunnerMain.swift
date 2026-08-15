@@ -50,6 +50,16 @@ enum ImageInfoMode: String, ExpressibleByArgument, Sendable {
     case auto
 }
 
+extension FrameSamplingStrategy: ExpressibleByArgument {
+    public init?(argument: String) {
+        switch argument.lowercased() {
+        case "uniform": self = .uniform(count: defaultVideoFrameCount)
+        case "fps": self = .fps(rate: 1.0, maxFrames: defaultVideoFrameCount)
+        default: return nil
+        }
+    }
+}
+
 @main
 struct Main {
     static func main() async throws {
@@ -198,6 +208,19 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         help: "Include original image resolution in prompt: on, off, auto (default: auto)")
     var imageInfo: ImageInfoMode = .auto
 
+    @Option(name: .customLong("video"), help: "Path to a video file for vision-language models")
+    var videoPath: String?
+
+    @Option(
+        name: .customLong("video-frames"),
+        help: "Number of frames to extract from video (default: \(defaultVideoFrameCount))")
+    var videoFrames: Int = defaultVideoFrameCount
+
+    @Option(
+        name: .customLong("video-sampling"),
+        help: "Video frame sampling: uniform (default) or fps")
+    var videoSampling: FrameSamplingStrategy = .uniform(count: defaultVideoFrameCount)
+
     @Flag(
         name: .customLong("clear-coreai-cache"),
         help: "Clear Core AI cached specialization for this model before loading (forces re-specialization)"
@@ -222,6 +245,12 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         }
         if let c = chunkSize, c <= 0 {
             throw ValidationError("--chunk-size must be > 0")
+        }
+        if imagePath != nil && videoPath != nil {
+            throw ValidationError("--image and --video cannot be used together")
+        }
+        if videoFrames < 1 {
+            throw ValidationError("--video-frames must be >= 1")
         }
     }
 
@@ -376,7 +405,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             cacheHit = PreparedModel.isCached(at: languageModelURL)
         }
 
-        let assetLabel = try modelAssetTypeLabel(for: bundle.modelAssetPath)
+        let assetLabel = try modelAssetTypeLabel(for: languageModelURL.pathExtension)
         if !CLILogger.isVerbose {
             print("\n⏳ Preparing AI asset from \(assetLabel)...", terminator: "")
             fflush(stdout)
@@ -544,6 +573,21 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             return
         }
 
+        // VLM video path: if --video is provided
+        if let videoPath = videoPath {
+            try await runVLMVideoInference(
+                videoPath: videoPath,
+                inferenceEngine: inferenceEngine,
+                bundle: bundle,
+                tokenizer: tokenizer,
+                samplingConfiguration: samplingConfiguration,
+                maxTokens: maxTokens,
+                additionalEosTokenIds: additionalEosTokenIds,
+                displayPrompt: displayPrompt
+            )
+            return
+        }
+
         // Build text generator with preloaded inference engine
         CLILogger.log("Building text generator...", component: "Main")
 
@@ -637,6 +681,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             let needsLogits = saveLogits != nil || printLogits
             let generatedText: String
             var allLogits: [[LogitsScalarType]] = []
+            var allTokenIds: [Int] = []
 
             if needsLogits {
                 // Generate with logits
@@ -646,6 +691,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
                     stopSequences: stopSequences
                 )
                 generatedText = result.text
+                allTokenIds = result.tokenIds
                 allLogits = result.logits
             } else {
                 // Standard generation without logits
@@ -681,7 +727,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             if needsLogits && !allLogits.isEmpty {
                 try LogitsWriter.handleOutput(
                     logits: allLogits,
-                    generatedText: generatedOnly,
+                    generatedTokenIds: allTokenIds,
                     tokenizer: tokenizer,
                     saveLogitsLength: saveLogitsLength,
                     saveJsonPath: saveLogits,
@@ -740,30 +786,55 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             throw ExitCode.failure
         }
 
-        let constrainedStrategy = ConstrainedDecodingStrategy(
-            jsonSchema: schema,
-            vocabSize: vocabSize
-        )
+        let constrainedStrategy: any DecodingStrategy
+        if inferenceEngine is any ConstrainedGenerationCapable {
+            constrainedStrategy = PipelinedConstrainedDecodingStrategy(
+                jsonSchema: schema,
+                vocabSize: vocabSize
+            )
+        } else {
+            constrainedStrategy = ConstrainedDecodingStrategy(
+                jsonSchema: schema,
+                vocabSize: vocabSize
+            )
+        }
 
         let inferenceID = InstrumentsProfiler.beginInference(
             promptTokens: actualInputTokens, maxTokens: maxTokens)
 
+        await PerformanceMetrics.shared.recordPromptTokens(actualInputTokens)
+
         var generatedText = ""
+        var generatedTokenCount = 0
+
         let constrainedStream = try await constrainedStrategy.decode(
             from: input,
             tokenizer: tokenizer,
             inferenceEngine: inferenceEngine,
             samplingConfiguration: samplingConfiguration,
-            options: InferenceOptions(maxTokens: maxTokens, includeLogits: true),
+            options: InferenceOptions(maxTokens: maxTokens),
             stopSequences: stopSequences
         )
+
+        var promptSpan: ProfileSpan? = InstrumentsProfiler.beginPrompt(
+            tokens: actualInputTokens, engine: "CoreAI-Constrained")
+        var extendSpan: ProfileSpan?
+
         for try await result in constrainedStream {
+            if promptSpan != nil {
+                promptSpan?.end()
+                promptSpan = nil
+                extendSpan = InstrumentsProfiler.beginExtend(step: 0, tokens: 1)
+            }
             generatedText += result.text
+            generatedTokenCount += 1
             print(result.text, terminator: "")
         }
+        promptSpan?.end()
+        extendSpan?.end()
         print()
 
-        let generatedTokenCount = tokenizer.encode(text: generatedText).count
+        await PerformanceMetrics.shared.recordGeneratedTokens(generatedTokenCount)
         InstrumentsProfiler.endInference(generatedTokens: generatedTokenCount, signpostID: inferenceID)
         await PerformanceMetrics.shared.endOverallTiming()
     }
@@ -903,15 +974,90 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             }
         }
 
-        // Build VLM prompt with image placeholder tokens.
-        // Try using the tokenizer's chat template if available; fall back to
-        // generic "USER: <image>×N \n prompt \nASSISTANT:" format.
+        try await runVLMGeneration(
+            vlmEngine: vlmEngine,
+            embeddedInput: embeddedInput,
+            visionConfig: visionConfig,
+            tokenizer: tokenizer,
+            samplingConfiguration: samplingConfiguration,
+            maxTokens: maxTokens,
+            additionalEosTokenIds: additionalEosTokenIds,
+            displayPrompt: effectivePrompt
+        )
+    }
+
+    // MARK: - VLM Video Inference
+
+    private func runVLMVideoInference(
+        videoPath: String,
+        inferenceEngine: any InferenceEngine,
+        bundle: LanguageBundle,
+        tokenizer: any Tokenizer,
+        samplingConfiguration: SamplingConfiguration,
+        maxTokens: Int,
+        additionalEosTokenIds: [Int32],
+        displayPrompt: String
+    ) async throws {
+        guard let vlmEngine = inferenceEngine as? any MultimodalInferenceEngine else {
+            print("Error: --video requires a vision-language model (engine does not support multimodal)")
+            throw ExitCode.failure
+        }
+
+        let videoURL = URL(fileURLWithPath: videoPath)
+        guard FileManager.default.fileExists(atPath: videoURL.path) else {
+            print("Error: video not found at \(videoPath)")
+            throw ExitCode.failure
+        }
+
+        guard let visionConfig = bundle.visionConfig else {
+            print("Error: VLM bundle missing 'vision' config in metadata.json")
+            throw ExitCode.failure
+        }
+
+        let sampling = videoSampling.withFrameCount(videoFrames)
+
+        if !CLILogger.isVerbose {
+            print("Generating...")
+        }
+
+        CLILogger.log("Extracting \(videoFrames) frames from: \(videoPath)", component: "VLM")
+        let videoInput = try await VideoInput.fromURL(videoURL, sampling: sampling)
+        CLILogger.log("Encoding video frames...", component: "VLM")
+        let embeddedInput = try await vlmEngine.encodeVideo(videoInput)
+        CLILogger.log(
+            "Video encoded: \(embeddedInput.tokenCount) visual tokens from \(videoInput.frameCount ?? 0) frames",
+            component: "VLM")
+
+        try await runVLMGeneration(
+            vlmEngine: vlmEngine,
+            embeddedInput: embeddedInput,
+            visionConfig: visionConfig,
+            tokenizer: tokenizer,
+            samplingConfiguration: samplingConfiguration,
+            maxTokens: maxTokens,
+            additionalEosTokenIds: additionalEosTokenIds,
+            displayPrompt: displayPrompt
+        )
+    }
+
+    // MARK: - Shared VLM Generation
+
+    private func runVLMGeneration(
+        vlmEngine: any MultimodalInferenceEngine,
+        embeddedInput: InputEmbeddings,
+        visionConfig: VisionConfig,
+        tokenizer: any Tokenizer,
+        samplingConfiguration: SamplingConfiguration,
+        maxTokens: Int,
+        additionalEosTokenIds: [Int32],
+        displayPrompt: String
+    ) async throws {
         let imageTokenCount = embeddedInput.tokenCount
         let imageTokenId = visionConfig.imageTokenId
         let vlmTokens: [Int32]
 
         if let chatTemplateTokens = try? buildVLMPromptFromChatTemplate(
-            prompt: effectivePrompt,
+            prompt: displayPrompt,
             imageTokenCount: imageTokenCount,
             imageTokenId: imageTokenId,
             tokenizer: tokenizer
@@ -924,17 +1070,16 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
                 component: "VLM")
             var tokens = tokenizer.encode(text: "USER: ", addSpecialTokens: true).map { Int32($0) }
             tokens.append(contentsOf: [Int32](repeating: imageTokenId, count: imageTokenCount))
-            let suffix = "\n" + effectivePrompt + "\nASSISTANT:"
+            let suffix = "\n" + displayPrompt + "\nASSISTANT:"
             tokens.append(
                 contentsOf: tokenizer.encode(text: suffix, addSpecialTokens: false).map { Int32($0) })
             vlmTokens = tokens
         }
 
         CLILogger.log(
-            "VLM prompt: \(vlmTokens.count) tokens (\(imageTokenCount) image placeholders)",
+            "VLM prompt: \(vlmTokens.count) tokens (\(imageTokenCount) visual placeholders)",
             component: "VLM")
 
-        // Build stop token set
         var eosTokenIds = Set<Int32>()
         if let eos = tokenizer.eosTokenId { eosTokenIds.insert(Int32(eos)) }
         eosTokenIds.formUnion(additionalEosTokenIds)
@@ -950,7 +1095,6 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
 
         let inferenceID = InstrumentsProfiler.beginInference(
             promptTokens: vlmTokens.count, maxTokens: maxTokens)
-
         await PerformanceMetrics.shared.recordPromptTokens(vlmTokens.count)
 
         let tokenStream = try await vlmEngine.generate(
@@ -965,8 +1109,8 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
 
         CLILogger.log("VLM generate started, maxTokens=\(maxTokens)", component: "VLM")
 
-        // Prompt (prefill) timing — first token latency
-        var promptSpan: ProfileSpan? = InstrumentsProfiler.beginPrompt(tokens: vlmTokens.count, engine: "CoreAIVLM")
+        var promptSpan: ProfileSpan? = InstrumentsProfiler.beginPrompt(
+            tokens: vlmTokens.count, engine: "CoreAIVLM")
         var extendSpan: ProfileSpan?
         let needsLogits = printLogits || saveLogits != nil
         let topKCount = saveLogitsLength.topKForFile ?? 5
@@ -1012,12 +1156,10 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         extendSpan?.end()
         print()
 
-        // Save logits to JSON if requested
         if let path = saveLogits, !allTokenLogits.isEmpty {
             try LogitsWriter.saveTopKJSON(tokenLogits: allTokenLogits, path: path)
         }
 
-        // Record generation stats
         InstrumentsProfiler.endInference(
             generatedTokens: generatedTokens.count, signpostID: inferenceID)
         await PerformanceMetrics.shared.recordGeneratedTokens(generatedTokens.count)
@@ -1075,8 +1217,8 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
 
     // MARK: - Asset Type Label
 
-    private func modelAssetTypeLabel(for path: String) throws -> String {
-        switch URL(fileURLWithPath: path).pathExtension.lowercased() {
+    private func modelAssetTypeLabel(for ext: String) throws -> String {
+        switch ext.lowercased() {
         case "aimodelc": return "compiled"
         case "aimodel": return "source"
         default:
