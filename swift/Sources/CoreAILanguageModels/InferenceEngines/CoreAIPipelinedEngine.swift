@@ -566,6 +566,7 @@ private struct EngineImpl: ~Copyable {
     // GPU sampler — reuses MPSGraphSampler from MPSGraphSamplers.swift
     var cachedSampler: (any MPSGraphSampler)?
     var cachedSamplerTemperature: Double?
+    var penaltyState: RepetitionPenaltyGPUState?
 
     // State
     var processedTokenCount: Int = 0
@@ -817,6 +818,24 @@ private struct EngineImpl: ~Copyable {
             return existingSampler
         }
 
+        // Create penalized sampler if repetition penalty is configured
+        if config.needsRepetitionPenalty {
+            if config.temperature == 0 {
+                throw InferenceRuntimeError.invalidArgument(
+                    "Repetition penalty with greedy sampling is not supported on pipelined engine. "
+                        + "Use temperature > 0, or use a sequential engine.")
+            }
+            if penaltyState == nil {
+                penaltyState = try RepetitionPenaltyGPUState(
+                    device: device,
+                    vocabSize: self.config.vocabSize,
+                    pipelineDepth: pipelineDepth,
+                    penalty: config.repetitionPenalty!,
+                    windowSize: config.repetitionPenaltyWindow
+                )
+            }
+        }
+
         let newSampler = try MPSGraphSamplerFactory.makeSampler(
             device: device,
             vocabSize: self.config.vocabSize,
@@ -975,23 +994,45 @@ private struct EngineImpl: ~Copyable {
         let sampleSpan = InstrumentsProfiler.beginSampleEncoding(
             step: currentStep, strategy: samplerStrategy, temperature: samplerTemperature)
 
-        do {
-            let queue = pipelineQueue
-            let localInFlightGate = inFlightGate
-            let completionCallback: (Int32) -> Void = { nextToken in
-                // Release the pipeline slot acquired before encode. Happens on
-                // Metal's callback thread — PipelineGate.release() is thread-safe.
-                localInFlightGate.release()
-                InstrumentsProfiler.endCustomInterval(
-                    name: "CoreAIPipelinedEncodeNextStep",
-                    signpostID: encodeStepID,
-                    details: "token=\(nextToken)"
-                )
-                continuation.yield(nextToken)
+        let queue = pipelineQueue
+        let localInFlightGate = inFlightGate
+        let localPenaltyState = penaltyState
+        let completionCallback: (Int32, Error?) -> Void = { nextToken, error in
+            // Update penalty state BEFORE releasing the gate.
+            localPenaltyState?.recordToken(nextToken)
+            // Release the pipeline slot acquired before encode. Happens on
+            // Metal's callback thread — PipelineGate.release() is thread-safe.
+            localInFlightGate.release()
+            InstrumentsProfiler.endCustomInterval(
+                name: "CoreAIPipelinedEncodeNextStep",
+                signpostID: encodeStepID,
+                details: "token=\(nextToken)"
+            )
+            if let error {
+                continuation.finish(throwing: error)
+                return
             }
+            continuation.yield(nextToken)
+        }
 
-            if queryLength == 1 {
-                localGPUSampler.encode(
+        do {
+            // Use penalty-aware path for decode steps when penalty is active.
+            if queryLength == 1, let state = penaltyState,
+                let compositeSampler = localGPUSampler as? MPSGraphCompositeSampler,
+                compositeSampler.penaltyEnabled
+            {
+                let penaltyBuf = state.buffer(forStep: currentStep)
+                compositeSampler.encode(
+                    to: queue,
+                    logitsBuffer: samplerLogitsBuffer,
+                    logitsOffset: logitsOffset,
+                    penaltyBuffer: penaltyBuf,
+                    outputBuffer: outputBuffer,
+                    outputOffset: 0,
+                    completion: completionCallback
+                )
+            } else if queryLength == 1 {
+                try localGPUSampler.encode(
                     to: queue,
                     logitsBuffer: samplerLogitsBuffer,
                     logitsOffset: logitsOffset,
@@ -1009,6 +1050,15 @@ private struct EngineImpl: ~Copyable {
                     completion: completionCallback
                 )
             }
+        } catch {
+            localInFlightGate.release()
+            InstrumentsProfiler.endCustomInterval(
+                name: "CoreAIPipelinedEncodeNextStep",
+                signpostID: encodeStepID,
+                details: "error"
+            )
+            sampleSpan.end()
+            throw error
         }
 
         sampleSpan.end()
@@ -1222,8 +1272,12 @@ private struct EngineImpl: ~Copyable {
                     tokens: prefillTokens,
                     gpuSampler: gpuSampler,
                     applyBitmask: applyInitialMask
-                ) { token in
-                    cont.resume(returning: token)
+                ) { token, error in
+                    if let error = error {
+                        cont.resume(throwing: error)
+                    } else {
+                        cont.resume(returning: token)
+                    }
                 }
             } catch {
                 cont.resume(throwing: error)
@@ -1259,8 +1313,12 @@ private struct EngineImpl: ~Copyable {
                             tokens: [lastToken] + jumpTokens,
                             gpuSampler: gpuSampler,
                             applyBitmask: applyMaskAfterJump
-                        ) { token in
-                            cont.resume(returning: token)
+                        ) { token, error in
+                            if let error = error {
+                                cont.resume(throwing: error)
+                            } else {
+                                cont.resume(returning: token)
+                            }
                         }
                     } catch {
                         cont.resume(throwing: error)
@@ -1289,8 +1347,12 @@ private struct EngineImpl: ~Copyable {
                         tokens: [],
                         gpuSampler: gpuSampler,
                         applyBitmask: applyMask
-                    ) { token in
-                        cont.resume(returning: token)
+                    ) { token, error in
+                        if let error = error {
+                            cont.resume(throwing: error)
+                        } else {
+                            cont.resume(returning: token)
+                        }
                     }
                 } catch {
                     cont.resume(throwing: error)
@@ -1368,7 +1430,7 @@ private struct EngineImpl: ~Copyable {
         tokens: [Int32],
         gpuSampler: any MPSGraphSampler,
         applyBitmask: Bool,
-        completion: @escaping (Int32) -> Void
+        completion: @escaping (Int32, Error?) -> Void
     ) throws {
         let actualTokenCount = tokens.isEmpty ? 1 : tokens.count
         let queryLength = actualTokenCount
@@ -1459,7 +1521,7 @@ private struct EngineImpl: ~Copyable {
         let queue = pipelineQueue
 
         if queryLength == 1 {
-            gpuSampler.encode(
+            try gpuSampler.encode(
                 to: queue, logitsBuffer: logitsBuffer, logitsOffset: 0,
                 outputBuffer: outputBuffer, outputOffset: 0,
                 applyBitmask: applyBitmask, completion: completion
@@ -1673,14 +1735,20 @@ private struct EngineImpl: ~Copyable {
 
             do {
                 let queue = pipelineQueue
-                warmupSampler.encode(
+                var error: Error?
+                try warmupSampler.encode(
                     to: queue,
                     logitsBuffer: warmupLogitsBuffer,
                     logitsOffset: logitsOffset,
                     outputBuffer: warmupOutputBuffer,
                     outputOffset: 0,
-                    completion: { _ in }
+                    completion: { _, e in
+                        error = e
+                    }
                 )
+                if let error {
+                    throw error
+                }
             }
 
             step += 1
