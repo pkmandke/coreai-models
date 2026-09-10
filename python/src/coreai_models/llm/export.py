@@ -95,7 +95,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Override the coreai-opt execution mode for pre-export torch quantization "
         "(macOS only). Defaults to whatever the compression preset or YAML sets. "
-        "'graph' externalizes composite ops and disables mmap-backed finalization.",
+        "'graph' externalizes composite ops. mmap-backed finalization is "
+        "supported in both eager and graph mode (CoreAI backend).",
     )
     parser.add_argument(
         "--max-context-length",

@@ -239,7 +239,7 @@ def quantize_pytorch_model(
     finalized_model = quantizer.finalize(
         prepared_model,
         backend=export_backend,
-        mmap_dir=mmap_dir if quantizer._execution_mode == ExecutionMode.EAGER else None,
+        mmap_dir=mmap_dir,
     )
     if isinstance(finalized_model, torch.fx.GraphModule):
         torch.ao.quantization.move_exported_model_to_eval(finalized_model)

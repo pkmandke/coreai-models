@@ -206,9 +206,7 @@ async def _async_export_model(config: ExportConfig) -> str:
     logger.info(f"Loading {config.hf_model_id} ({config.variant}, dtype={target_dtype})...")
 
     # Memory-efficient layer-by-layer loading + quantizer disk-checkpointing
-    # is macOS-only for now. The iOS variant keeps the legacy full-RAM path
-    # since its palettization flow has not been validated against streaming
-    # weight loading.
+    # is macOS-only. The iOS variant keeps the dedfault no-mmap path.
     use_memory_efficient = config.variant == "macOS"
     temp_dir_ctx: contextlib.AbstractContextManager[str | None] = (
         tempfile.TemporaryDirectory(prefix="coreai_export_")
@@ -289,8 +287,7 @@ async def _async_export_model(config: ExportConfig) -> str:
             graph_mode = is_compression_mode_graph(quant_cfg)
 
             quantizer_mmap_dir: str | None = None
-            # coreai-opt only supports mmap-backed finalization in eager mode.
-            if use_memory_efficient and not graph_mode:
+            if use_memory_efficient:
                 assert temp_dir is not None
                 quantizer_mmap_dir = os.path.join(temp_dir, "quantized")
                 os.makedirs(quantizer_mmap_dir, exist_ok=True)
