@@ -121,6 +121,13 @@ def build_parser() -> argparse.ArgumentParser:
         "(default: 32). iOS only.",
     )
     parser.add_argument(
+        "--ios-memory-efficient",
+        action="store_true",
+        help="iOS only. Opt in to the memory-efficient (mmap-backed) "
+        "layer-by-layer weight load and disk-checkpointed palettization "
+        "finalize.",
+    )
+    parser.add_argument(
         "--list-presets",
         action="store_true",
         help="List available compression presets and exit",
@@ -375,6 +382,9 @@ def _resolve_export_config(args: argparse.Namespace) -> ExportConfig:
         )
     palettization_num_workers = args.ios_compression_num_workers or 32
 
+    if args.ios_memory_efficient and variant != "iOS":
+        raise SystemExit(f"--ios-memory-efficient requires --platform iOS (got '{variant}').")
+
     return ExportConfig(
         hf_model_id=hf_model_id,
         variant=variant,
@@ -388,6 +398,7 @@ def _resolve_export_config(args: argparse.Namespace) -> ExportConfig:
         compression_config_object=compression_config_object,
         disable_embedding_quantization=args.disable_embedding_quantization_ios,
         palettization_num_workers=palettization_num_workers,
+        ios_memory_efficient=args.ios_memory_efficient,
         include_debug_info=args.include_debug_info,
     )
 
@@ -456,6 +467,7 @@ def main() -> None:
         if config.variant == "iOS":
             print(f"  disable_embedding_quantization: {config.disable_embedding_quantization}")
             print(f"  palettization_num_workers: {config.palettization_num_workers}")
+            print(f"  ios_memory_efficient: {config.ios_memory_efficient}")
         return
 
     result = export_model(config)

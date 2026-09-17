@@ -61,6 +61,9 @@ class ExportConfig:
     overwrite: bool = False
     # iOS-only: number of parallel worker processes for KMeans palettization.
     palettization_num_workers: int = 32
+    # iOS-only opt-in. When True, iOS uses the memory-efficient (mmap-backed)
+    # layer-by-layer weight load and disk-checkpointed palettization finalize.
+    ios_memory_efficient: bool = False
     # iOS only. When True, embedding table is not quantized to int8.
     disable_embedding_quantization: bool = False
     # When True, the converter embeds debug information in the exported .aimodel
@@ -184,20 +187,31 @@ async def _async_export_model(config: ExportConfig) -> str:
 
     logger.info(f"Loading {config.hf_model_id} ({config.variant}, dtype={target_dtype})...")
 
-    # Both variants load weights layer-by-layer (mmap-backed).
+    # macOS always loads weights layer-by-layer (mmap-backed). For iOS this
+    # path is opt-in via --ios-memory-efficient and is off by default.
+    use_memory_efficient = config.variant == "macOS" or config.ios_memory_efficient
     with tempfile.TemporaryDirectory(prefix="coreai_export_") as temp_dir:
-        layer_mmap_dir = os.path.join(temp_dir, "layers")
-        os.makedirs(layer_mmap_dir, exist_ok=True)
-        model = model_class.from_hf_memory_efficient(
-            config.hf_model_id,
-            max_context_length=max_context_length,
-            target_dtype=target_dtype,
-            mmap_path=layer_mmap_dir,
-            num_layers=config.num_layers,
-            hf_config_attr=entry.hf_config_attr,
-            hf_state_dict_prefix=entry.hf_state_dict_prefix,
-            disable_embedding_quantization=config.disable_embedding_quantization,
-        )
+        if use_memory_efficient:
+            layer_mmap_dir = os.path.join(temp_dir, "layers")
+            os.makedirs(layer_mmap_dir, exist_ok=True)
+            model = model_class.from_hf_memory_efficient(
+                config.hf_model_id,
+                max_context_length=max_context_length,
+                target_dtype=target_dtype,
+                mmap_path=layer_mmap_dir,
+                num_layers=config.num_layers,
+                hf_config_attr=entry.hf_config_attr,
+                hf_state_dict_prefix=entry.hf_state_dict_prefix,
+                disable_embedding_quantization=config.disable_embedding_quantization,
+            )
+        else:
+            model = model_class.from_hf(
+                config.hf_model_id,
+                max_context_length=max_context_length,
+                target_dtype=target_dtype,
+                num_layers=config.num_layers,
+                disable_embedding_quantization=config.disable_embedding_quantization,
+            )
         model = model.eval()
         # ---- 3. Resolve compression preset ----
         if config.compression_config_object is not None:
@@ -278,8 +292,10 @@ async def _async_export_model(config: ExportConfig) -> str:
                 key_cache,
                 value_cache,
             )
-            palettization_mmap_dir = os.path.join(temp_dir, "palettized")
-            os.makedirs(palettization_mmap_dir, exist_ok=True)
+            palettization_mmap_dir: str | None = None
+            if use_memory_efficient:
+                palettization_mmap_dir = os.path.join(temp_dir, "palettized")
+                os.makedirs(palettization_mmap_dir, exist_ok=True)
 
             model = palettize_pytorch_model(
                 model,

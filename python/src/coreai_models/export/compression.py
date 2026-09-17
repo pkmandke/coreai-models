@@ -318,7 +318,6 @@ def palettize_pytorch_model(
         mmap_dir: Optional directory for memory-efficient finalization.
             When provided, each finalized layer is saved to a per-layer
             safetensors file and reloaded mmap-backed.
-            When None, finalization keeps weights in RAM.
         num_workers: Number of parallel worker processes for KMeans centroid
             calculation. Defaults to 32.
 
