@@ -35,6 +35,15 @@ class AIModelMetadataFields:
 # `coreai_models.model_registry`, add a matching entry here.
 _METADATA: dict[str, AIModelMetadataFields] = {
     # ---- LLMs ----
+    "allenai/OLMo-2-0425-1B-Instruct": AIModelMetadataFields(
+        author="Allen Institute for AI",
+        license="Apache-2.0",
+        model_description=(
+            "OLMo-2-0425-1B-Instruct is a 1B-parameter instruction-tuned causal "
+            "language model from Allen Institute for AI's OLMo 2 family. "
+            "Source: https://huggingface.co/allenai/OLMo-2-0425-1B-Instruct"
+        ),
+    ),
     "Qwen/Qwen2.5-1.5B-Instruct": AIModelMetadataFields(
         author="Qwen Team",
         license="Apache-2.0",
@@ -50,6 +59,14 @@ _METADATA: dict[str, AIModelMetadataFields] = {
         model_description=(
             "Qwen3-0.6B is a 0.6B-parameter causal language model from the Qwen3 "
             "family. Source: https://huggingface.co/Qwen/Qwen3-0.6B"
+        ),
+    ),
+    "Qwen/Qwen3-1.7B": AIModelMetadataFields(
+        author="Qwen Team",
+        license="Apache-2.0",
+        model_description=(
+            "Qwen3-1.7B is a 1.7B-parameter causal language model from the Qwen3 "
+            "family. Source: https://huggingface.co/Qwen/Qwen3-1.7B"
         ),
     ),
     "Qwen/Qwen3-4B": AIModelMetadataFields(
@@ -95,6 +112,24 @@ _METADATA: dict[str, AIModelMetadataFields] = {
             "Source: https://huggingface.co/google/gemma-3-12b-it"
         ),
     ),
+    "google/gemma-3n-E2B-it": AIModelMetadataFields(
+        author="Gemma Team",
+        license="Gemma Terms of Use",
+        model_description=(
+            "Gemma 3n E2B is a ~5B-parameter on-device language model from Google's "
+            "Gemma 3n family using AltUp for efficient inference. "
+            "Source: https://huggingface.co/google/gemma-3n-E2B-it"
+        ),
+    ),
+    "google/gemma-3n-E4B-it": AIModelMetadataFields(
+        author="Gemma Team",
+        license="Gemma Terms of Use",
+        model_description=(
+            "Gemma 3n E4B is a ~10B-parameter on-device language model from Google's "
+            "Gemma 3n family using AltUp for efficient inference. "
+            "Source: https://huggingface.co/google/gemma-3n-E4B-it"
+        ),
+    ),
     "mistralai/Mistral-7B-Instruct-v0.3": AIModelMetadataFields(
         author="Mistral AI",
         license="Apache-2.0",
@@ -113,6 +148,33 @@ _METADATA: dict[str, AIModelMetadataFields] = {
             "Source: https://huggingface.co/mistralai/Mixtral-8x7B-Instruct-v0.1"
         ),
     ),
+    "HuggingFaceTB/SmolLM2-1.7B-Instruct": AIModelMetadataFields(
+        author="HuggingFace",
+        license="Apache-2.0",
+        model_description=(
+            "SmolLM2-1.7B-Instruct is a 1.7B-parameter instruction-tuned causal "
+            "language model from HuggingFace. "
+            "Source: https://huggingface.co/HuggingFaceTB/SmolLM2-1.7B-Instruct"
+        ),
+    ),
+    "HuggingFaceTB/SmolLM2-360M-Instruct": AIModelMetadataFields(
+        author="HuggingFace",
+        license="Apache-2.0",
+        model_description=(
+            "SmolLM2-360M-Instruct is a 360M-parameter instruction-tuned causal "
+            "language model from HuggingFace. "
+            "Source: https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct"
+        ),
+    ),
+    "HuggingFaceTB/SmolLM2-135M-Instruct": AIModelMetadataFields(
+        author="HuggingFace",
+        license="Apache-2.0",
+        model_description=(
+            "SmolLM2-135M-Instruct is a 135M-parameter instruction-tuned causal "
+            "language model from HuggingFace. "
+            "Source: https://huggingface.co/HuggingFaceTB/SmolLM2-135M-Instruct"
+        ),
+    ),
     "openai/gpt-oss-20b": AIModelMetadataFields(
         author="OpenAI",
         license="Apache-2.0",
@@ -120,6 +182,25 @@ _METADATA: dict[str, AIModelMetadataFields] = {
             "gpt-oss-20b is a 20B-parameter open-weights causal language model "
             "released by OpenAI. "
             "Source: https://huggingface.co/openai/gpt-oss-20b"
+        ),
+    ),
+    "meta-models/Muse-Glimmer-30B": AIModelMetadataFields(
+        author="Meta",
+        license="Apache-2.0",
+        model_description=(
+            "Muse Glimmer 30B is a 30B-parameter on-device agentic language model "
+            "from Meta with sliding/global attention and gated attention. "
+            "Source: https://huggingface.co/meta-models/Muse-Glimmer-30B"
+        ),
+    ),
+    "meta-models/Muse-Glimmer-30B-assistant": AIModelMetadataFields(
+        author="Meta",
+        license="Apache-2.0",
+        model_description=(
+            "Muse Glimmer 30B assistant is a speculative-decoding drafter "
+            "companion for Meta's Muse Glimmer 30B model (5 transformer layers, "
+            "sliding-window only). "
+            "Source: https://huggingface.co/meta-models/Muse-Glimmer-30B-assistant"
         ),
     ),
     # ---- VLMs ----
@@ -171,6 +252,15 @@ _METADATA: dict[str, AIModelMetadataFields] = {
             "Source: https://huggingface.co/black-forest-labs/FLUX.2-klein-4B"
         ),
     ),
+    "Wan-AI/Wan2.1-T2V-1.3B-Diffusers": AIModelMetadataFields(
+        author="Wan Team",
+        license="Apache-2.0",
+        model_description=(
+            "Wan 2.1 T2V 1.3B is a 1.3B-parameter text-to-video diffusion "
+            "transformer generating 480p video at up to 81 frames. "
+            "Source: https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
+        ),
+    ),
     # ---- Segmentation ----
     "facebook/sam3": AIModelMetadataFields(
         author="N. Carion et al.",
@@ -178,8 +268,7 @@ _METADATA: dict[str, AIModelMetadataFields] = {
         model_description=(
             "SAM 3 is a unified foundation model for promptable segmentation in "
             "images and videos. It can detect, segment, and track objects using "
-            "text or visual prompts such as points, boxes, and masks. This export "
-            "targets image segmentation, re-authored for iOS. "
+            "text or visual prompts such as points, boxes, and masks. "
             "Source: https://github.com/facebookresearch/sam3"
         ),
     ),

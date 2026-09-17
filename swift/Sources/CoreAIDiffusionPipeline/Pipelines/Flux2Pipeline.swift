@@ -9,22 +9,45 @@ import CoreAIShared
 import CoreGraphics
 import Tokenizers
 
+/// A traced img2img graph: which asset holds it, and under which entrypoint.
+public struct Img2ImgRoute: Sendable {
+    public let function: CoreAIDiffusionModelFunction
+    public let entrypoint: String
+
+    public init(function: CoreAIDiffusionModelFunction, entrypoint: String) {
+        self.function = function
+        self.entrypoint = entrypoint
+    }
+}
+
 /// FLUX.2 Klein pipeline using Core AI backend.
 ///
-/// Orchestrates: tokenize → text encode → RoPE compute → noise → pack →
-/// denoise loop (flow-match Euler) → unpack → BN denorm → unpatchify → VAE decode.
+/// Orchestrates: tokenize → text encode → noise → pack → denoise loop
+/// (flow-match Euler) → unpack → BN denorm → unpatchify → VAE decode.
 ///
-/// Key design: RoPE embeddings are pre-computed in Swift and passed as model inputs
-/// (not computed in-graph) to avoid graph optimizer issues on monolithic
-/// 25-block transformers.
+/// RoPE is computed inside the transformer graph; this pipeline only supplies
+/// position IDs, which depend on grid geometry alone.
 public struct Flux2Pipeline: DiffusionPipeline {
     public let descriptor: PipelineDescriptor
     public let mode: DecodeResolution
 
     public let transformer: CoreAIDiffusionModelFunction
+    /// How each reference grid reaches a traced graph, resolved at load time.
+    ///
+    /// img2img arrives two ways and a bundle can contain both, because export directories
+    /// accumulate assets across runs. Resolving to (asset, entrypoint) pairs up front
+    /// keeps the choice in one place:
+    ///
+    /// - multi-function: an `img2img_*` entrypoint on `transformer` — preferred, since it
+    ///   reuses the already-loaded asset instead of a second ~2 GB weight set
+    /// - single-function: a `Transformer[_512]_img2img_<grid>` asset, entrypoint `main`
+    ///
+    /// A grid absent from both is simply not supported by the bundle.
+    public let img2imgRoutes: [ReferenceGrid: Img2ImgRoute]
     public let textEncoder: CoreAIDiffusionModelFunction
     public let decoder: CoreAIDiffusionModelFunction
     public let encoder: CoreAIDiffusionModelFunction?
+    public let transformerFunctionName: String
     public let tokenizer: any Tokenizer
 
     public let batchNormMean: [Float]?
@@ -36,8 +59,11 @@ public struct Flux2Pipeline: DiffusionPipeline {
     private static let patchSize = 16
     private static let latentChannels = 128
     private static let textSeqLen = 512
-    private static let defaultRopeTheta: Float = 2000.0
     private static let qwen3PadTokenId = 151643
+
+    /// Reference tokens sit at T=10 on RoPE axis 0, separating them from the noise
+    /// grid (T=0) where H/W would otherwise collide. Matches the export-time dummies.
+    private static let referenceTokenTimeOffset: Float = 10
 
     /// FLUX.2 flow-matching timestep shift.
     ///
@@ -96,9 +122,11 @@ public struct Flux2Pipeline: DiffusionPipeline {
         descriptor: PipelineDescriptor,
         mode: DecodeResolution = .full,
         transformer: CoreAIDiffusionModelFunction,
+        img2imgRoutes: [ReferenceGrid: Img2ImgRoute] = [:],
         textEncoder: CoreAIDiffusionModelFunction,
         decoder: CoreAIDiffusionModelFunction,
         encoder: CoreAIDiffusionModelFunction?,
+        transformerFunctionName: String = "main",
         tokenizer: any Tokenizer,
         batchNormMean: [Float]?,
         batchNormVar: [Float]?,
@@ -107,9 +135,11 @@ public struct Flux2Pipeline: DiffusionPipeline {
         self.descriptor = descriptor
         self.mode = mode
         self.transformer = transformer
+        self.img2imgRoutes = img2imgRoutes
         self.textEncoder = textEncoder
         self.decoder = decoder
         self.encoder = encoder
+        self.transformerFunctionName = transformerFunctionName
         self.tokenizer = tokenizer
         self.batchNormMean = batchNormMean
         self.batchNormVar = batchNormVar
@@ -129,10 +159,18 @@ public struct Flux2Pipeline: DiffusionPipeline {
         try await textEncoder.loadResources()
         try await decoder.loadResources()
         if let encoder { try await encoder.loadResources() }
+        // The img2img transformers are deliberately *not* loaded here. Each is a full
+        // weight set (~2 GB resident on GPU) that a txt2img run never touches, and
+        // `CoreAIDiffusionModelFunction` loads itself on first use anyway. They are still
+        // unloaded below, so a run that did use one releases it.
     }
 
     public func unloadResources() async {
         await transformer.unloadResources()
+        // Distinct assets only: multi-function routes point back at `transformer`.
+        for route in img2imgRoutes.values where route.function !== transformer {
+            await route.function.unloadResources()
+        }
         await textEncoder.unloadResources()
         await decoder.unloadResources()
         if let encoder { await encoder.unloadResources() }
@@ -142,7 +180,7 @@ public struct Flux2Pipeline: DiffusionPipeline {
 
     public func generateImages(
         configuration: PipelineConfiguration,
-        progressHandler: (PipelineProgress) -> Bool
+        progressHandler: ((PipelineProgress) -> Bool)?
     ) async throws -> GenerationResult {
         let steps = configuration.stepCount
         let guidanceScale = configuration.guidanceScale
@@ -159,12 +197,22 @@ public struct Flux2Pipeline: DiffusionPipeline {
         let seqLen = spatialSide * spatialSide
 
         // 3. Setup scheduler.
-        // For img2img: the schedule covers [strength → 0] using all steps, so every requested step
-        // contributes to denoising and the noising sigma matches the first scheduled step exactly.
-        // For txt2img: the schedule covers [1.0 → 0] as usual.
+        // Reference-token img2img uses the full schedule (1.0 → 0): structure comes
+        // from the concatenated reference tokens, not from noise blending. txt2img
+        // also uses [1.0 → 0]. So sigmaMax is 1.0 in both cases.
         let mu = Self.computeEmpiricalMu(imageSeqLen: seqLen, numSteps: steps)
         let isActuallyImg2Img = configuration.isImageToImage && encoder != nil && configuration.startingImage != nil
-        let sigmaMax: Float = isActuallyImg2Img ? configuration.strength : 1.0
+
+        // Reference-token img2img is incompatible with tiled decode: tiled uses the
+        // half-resolution VAE encoder (traced for 512×512), but the reference is
+        // encoded at the full image size — feeding it a 1024 image crashes on a
+        // shape mismatch. Fail early with a clear message instead.
+        if isActuallyImg2Img && mode == .tiled {
+            throw PipelineLoadError.unsupportedConfiguration(
+                "img2img is not supported with tiled decode. Use --decode-resolution full or half.")
+        }
+
+        let sigmaMax: Float = 1.0
         let scheduler = DiscreteFlowScheduler(
             stepCount: steps,
             trainStepCount: 1000,
@@ -180,59 +228,228 @@ public struct Flux2Pipeline: DiffusionPipeline {
         let noisePacked = packLatentsSpatialFlatten(
             noise, channels: inChannels, height: spatialSide, width: spatialSide)
 
-        // 5. Initialize packed latents (txt2img: pure noise; img2img: encoded image + noise blend)
+        // 5. Initialize packed latents and reference tokens
         var packedLatents: [Float]
+        var referenceTokens: [Float]?
+        var refSide: Int = 0
 
         if isActuallyImg2Img,
             let enc = encoder,
             let srcImage = configuration.startingImage
         {
-            packedLatents = try await prepareImg2ImgLatents(
-                encoder: enc,
-                srcImage: srcImage,
-                imageSize: imageSize,
-                spatialSide: spatialSide,
-                inChannels: inChannels,
-                noisePacked: noisePacked,
-                scheduler: scheduler
+            // Reference grid size based on the requested reference grid
+            switch configuration.referenceGrid {
+            case .full: refSide = spatialSide  // 64×64 = 4096 tokens
+            case .half: refSide = spatialSide / 2  // 32×32 = 1024 tokens
+            case .quarter: refSide = spatialSide / 4  // 16×16 = 256 tokens
+            }
+
+            // Encode reference at full resolution, then subsample tokens if needed
+            let fullRefPacked = try await encodeReferenceImage(
+                encoder: enc, srcImage: srcImage, imageSize: imageSize,
+                spatialSide: spatialSide, inChannels: inChannels
             )
+            let refPacked: [Float]
+            if refSide == spatialSide {
+                refPacked = fullRefPacked
+            } else {
+                refPacked = Self.subsampleTokens(
+                    fullRefPacked, fromSide: spatialSide, toSide: refSide, channels: inChannels)
+            }
+            referenceTokens = refPacked
             if configuration.lazyModelLoading { await enc.unloadResources() }
+
+            // FLUX.2 reference-token img2img: noise latents start from PURE NOISE.
+            // The reference tokens concatenated at each step provide structural
+            // guidance via cross-attention. The text prompt steers content.
+            // (This differs from SD-style img2img which blends noise with the encoded image.)
+            packedLatents = noisePacked
         } else {
             packedLatents = noisePacked
         }
 
-        // 6. Pre-compute RoPE embeddings (cos, sin)
+        // 6. Build RoPE position IDs — the transformer computes the frequencies in-graph
         let axesDims = descriptor.ropeAxesDims ?? [32, 32, 32, 32]
-        let theta = descriptor.ropeTheta ?? Self.defaultRopeTheta
-        let (rotaryCos, rotarySin) = computeRotaryEmbeddings(
-            imgHeight: spatialSide, imgWidth: spatialSide,
-            textSeqLen: textSeqLen, axesDims: axesDims, theta: theta
-        )
+        let axisCount = axesDims.count
+        // Image ids put H/W on axes 1/2; text ids put the seq index on the last axis.
+        guard axisCount >= 3 else {
+            throw PipelineLoadError.missingConfig(
+                "rope_axes_dims has \(axisCount) axes; FLUX.2 RoPE needs at least 3")
+        }
+        let refSeqLen = refSide * refSide
+        // img2img appends reference tokens after the noise tokens, marked T=10 on axis 0
+        // so the transformer's in-graph RoPE separates them from the noise grid.
+        let imageIds: [Float]
+        if referenceTokens != nil {
+            imageIds = buildImageIdsWithReference(
+                noiseSide: spatialSide, refSide: refSide, axisCount: axisCount)
+        } else {
+            imageIds = buildImageIds(side: spatialSide, axisCount: axisCount)
+        }
+        let textIds = buildTextIds(textSeqLen: textSeqLen, axisCount: axisCount)
 
         // 7. Denoising loop
-        let totalDim = axesDims.reduce(0, +)
-        let totalSeqLen = textSeqLen + seqLen
-        let ropeShape = [totalSeqLen, totalDim]
+        // Pick the asset + entrypoint that serves this pass. img2img arrives one of two
+        // ways: as a named entrypoint on the multi-function transformer, or as its own
+        // single-function asset. Which one is decided at load time by whether that asset
+        // exists on disk.
+        let denoiser: CoreAIDiffusionModelFunction
+        let fnName: String
+        if referenceTokens != nil {
+            // Name what the bundle does have, not just what it lacks: re-exporting is the
+            // only remedy, so the available set is the actionable part.
+            guard let route = img2imgRoutes[configuration.referenceGrid] else {
+                let available = img2imgRoutes.keys.map(\.rawValue).sorted()
+                throw PipelineLoadError.unsupportedConfiguration(
+                    available.isEmpty
+                        ? "this bundle has no img2img transformer. Export the img2img "
+                            + "components, or export without --single-function to get every "
+                            + "grid from a single asset."
+                        : "this bundle has no img2img transformer for the "
+                            + "\(configuration.referenceGrid) reference grid. Available: "
+                            + "\(available.joined(separator: ", ")).")
+            }
+            denoiser = route.function
+            fnName = route.entrypoint
+        } else {
+            denoiser = transformer
+            fnName = transformerFunctionName
+        }
+
+        // Manual CFG needs an unconditional pass, so encode an empty prompt.
+        //
+        // At exactly 1.0 the interpolation reduces to the conditional pass (the
+        // unconditional term's coefficient is zero) so the second forward pass is
+        // wasted. Below 1.0 the blend runs *toward* the unconditional prediction, i.e. 2x
+        // the compute to follow the prompt less, so this gate refuses that too.
+        //
+        // That second half is a deliberate divergence from diffusers, whose
+        // `ClassifierFreeGuidance` guider gates on `not isclose(scale, 1.0)` and so honours
+        // sub-1.0 scales. Widen this to match if a caller ever has a real use for them.
+        let emptyEmbeddings: [Float]?
+        if configuration.guidanceMode == .manual && guidanceScale > 1.0 {
+            emptyEmbeddings = try await encodeText("")
+        } else {
+            if configuration.guidanceMode == .manual {
+                CLILogger.log(
+                    "⚠️ Flux2Pipeline: --guidance-mode manual needs a guidance scale above 1.0 "
+                        + "(got \(guidanceScale)); falling back to distilled, which applies no "
+                        + "guidance at all. Raise the scale to get the two-pass path.",
+                    component: "Diffusion")
+            }
+            emptyEmbeddings = nil
+        }
+
+        // Reused across steps: manual CFG would otherwise allocate a fresh
+        // seqLen*inChannels array on every one.
+        var cfgBuffer = [Float](repeating: 0, count: seqLen * inChannels)
 
         for (step, t) in scheduler.timeSteps.enumerated() {
             let timestepValue = Float(t) / 1000.0
 
-            let output = try await transformer.run(floatInputs: [
-                (packedLatents, [1, seqLen, inChannels]),
-                (textEmbeddings, [1, textSeqLen, hiddenDim(textEmbeddings)]),
-                ([timestepValue], [1]),
-                ([guidanceScale], [1]),
-                (rotaryCos, ropeShape),
-                (rotarySin, ropeShape),
-            ])
+            // For img2img: concatenate noise + reference tokens at each step
+            let inputTokens: [Float]
+            let inputSeqLen: Int
+            if let ref = referenceTokens {
+                inputTokens = packedLatents + ref
+                inputSeqLen = seqLen + refSeqLen
+            } else {
+                inputTokens = packedLatents
+                inputSeqLen = seqLen
+            }
+
+            let output: [Float]
+
+            if let emptyEmb = emptyEmbeddings {
+                // Manual CFG: two forward passes. The guidance input is 0 only because the
+                // traced signature requires a value. The Flux2 model sets
+                // `guidance_embeds: false`, so `guidance_embedder` is nil and
+                // `Flux2TimestepGuidanceEmbeddings` drops the input entirely. Any value
+                // behaves identically; all the guidance here comes from the interpolation
+                // below, not from the model.
+                let condOutput = try await denoiser.run(
+                    floatInputs: [
+                        (inputTokens, [1, inputSeqLen, inChannels]),
+                        (textEmbeddings, [1, textSeqLen, hiddenDim(textEmbeddings)]),
+                        ([timestepValue], [1]),
+                        ([Float(0)], [1]),
+                        (imageIds, [1, inputSeqLen, axisCount]),
+                        (textIds, [1, textSeqLen, axisCount]),
+                    ], functionName: fnName)
+
+                let uncondOutput = try await denoiser.run(
+                    floatInputs: [
+                        (inputTokens, [1, inputSeqLen, inChannels]),
+                        (emptyEmb, [1, textSeqLen, hiddenDim(emptyEmb)]),
+                        ([timestepValue], [1]),
+                        ([Float(0)], [1]),
+                        (imageIds, [1, inputSeqLen, axisCount]),
+                        (textIds, [1, textSeqLen, axisCount]),
+                    ], functionName: fnName)
+
+                let condSlice: ArraySlice<Float>
+                let uncondSlice: ArraySlice<Float>
+                if referenceTokens != nil {
+                    condSlice = condOutput[0..<(seqLen * inChannels)]
+                    uncondSlice = uncondOutput[0..<(seqLen * inChannels)]
+                } else {
+                    condSlice = condOutput[0..<condOutput.count]
+                    uncondSlice = uncondOutput[0..<uncondOutput.count]
+                }
+                Self.applyClassifierFreeGuidance(
+                    cond: condSlice, uncond: uncondSlice,
+                    guidanceScale: guidanceScale, into: &cfgBuffer)
+                output = cfgBuffer
+            } else {
+                // Distilled: one pass, no CFG. `guidanceScale` is passed to satisfy the
+                // traced signature but this checkpoint discards it (see above).
+                let fullOutput = try await denoiser.run(
+                    floatInputs: [
+                        (inputTokens, [1, inputSeqLen, inChannels]),
+                        (textEmbeddings, [1, textSeqLen, hiddenDim(textEmbeddings)]),
+                        ([timestepValue], [1]),
+                        ([guidanceScale], [1]),
+                        (imageIds, [1, inputSeqLen, axisCount]),
+                        (textIds, [1, textSeqLen, axisCount]),
+                    ], functionName: fnName)
+
+                if referenceTokens != nil {
+                    output = Array(fullOutput[0..<(seqLen * inChannels)])
+                } else {
+                    output = fullOutput
+                }
+            }
 
             packedLatents = scheduler.step(output: output, timeStep: t, sample: packedLatents)
+            try checkLatentsAreFinite(packedLatents, step: step)
 
-            let progress = PipelineProgress(step: step + 1, totalSteps: steps, currentLatent: nil)
-            if !progressHandler(progress) { break }
+            if let progressHandler {
+                // Unpack → denorm → unpatchify: [1, 128, 64, 64] → [1, 32, 128, 128]
+                // These are array copies, no model call.
+                let spatial = unpackLatentsSpatialFlatten(
+                    packedLatents, channels: inChannels, height: spatialSide, width: spatialSide)
+                let denormed = applyBatchNormDenorm(
+                    spatial, channels: inChannels, height: spatialSide, width: spatialSide)
+                let unpatchified = Self.unpatchifyLatents(
+                    denormed, channels: inChannels, height: spatialSide, width: spatialSide)
+
+                let vaeChannels = inChannels / 4  // 128 → 32 after patchify
+                let vaeHeight = spatialSide * 2
+                let vaeWidth = spatialSide * 2
+                var previewLatents = NDArray(
+                    shape: [1, vaeChannels, vaeHeight, vaeWidth], scalarType: .float32)
+                previewLatents.mutableView(as: Float.self).withUnsafeMutablePointer { ptr, _, _ in
+                    for i in 0..<unpatchified.count { ptr[i] = unpatchified[i] }
+                }
+                let progress = PipelineProgress(step: step + 1, totalSteps: steps, currentLatent: previewLatents)
+                if !progressHandler(progress) { break }
+            }
         }
 
-        if configuration.lazyModelLoading { await transformer.unloadResources() }
+        if configuration.lazyModelLoading {
+            // Release whichever asset ran
+            await denoiser.unloadResources()
+        }
 
         // 8. Unpack: (B, H*W, C) → (B, C, H, W)
         var spatialLatents = unpackLatentsSpatialFlatten(
@@ -289,16 +506,15 @@ public struct Flux2Pipeline: DiffusionPipeline {
         return GenerationResult(images: [image], latents: [latentsND])
     }
 
-    // MARK: - Img2Img Latent Preparation
+    // MARK: - Img2Img
 
-    private func prepareImg2ImgLatents(
+    /// Encode a reference image into packed latent tokens (no noise blending).
+    private func encodeReferenceImage(
         encoder: CoreAIDiffusionModelFunction,
         srcImage: CGImage,
         imageSize: Int,
         spatialSide: Int,
-        inChannels: Int,
-        noisePacked: [Float],
-        scheduler: DiscreteFlowScheduler
+        inChannels: Int
     ) async throws -> [Float] {
         let resized = CGImageUtils.resize(srcImage, to: imageSize) ?? srcImage
         let encoderScaleFactor = descriptor.encoderScaleFactor ?? 0.18215
@@ -311,10 +527,8 @@ public struct Flux2Pipeline: DiffusionPipeline {
             scaledEncoded, inChannels: inChannels, height: spatialSide, width: spatialSide)
         let normalized = applyBatchNormNorm(
             patchified, channels: inChannels, height: spatialSide, width: spatialSide)
-        let cleanPacked = packLatentsSpatialFlatten(
+        return packLatentsSpatialFlatten(
             normalized, channels: inChannels, height: spatialSide, width: spatialSide)
-
-        return scheduler.addNoise(to: cleanPacked, noise: noisePacked, at: scheduler.startSigma)
     }
 
     // MARK: - Text Encoding
@@ -383,71 +597,115 @@ public struct Flux2Pipeline: DiffusionPipeline {
         embeddings.count / Self.textSeqLen
     }
 
-    // MARK: - RoPE Pre-computation
+    // MARK: - RoPE Position IDs
 
-    private func computeRotaryEmbeddings(
-        imgHeight: Int, imgWidth: Int,
-        textSeqLen: Int, axesDims: [Int], theta: Float
-    ) -> ([Float], [Float]) {
-        let imgSeqLen = imgHeight * imgWidth
-        let totalSeqLen = textSeqLen + imgSeqLen
-        let totalDim = axesDims.reduce(0, +)
-
-        var cosScalars = [Float](repeating: 0, count: totalSeqLen * totalDim)
-        var sinScalars = [Float](repeating: 0, count: totalSeqLen * totalDim)
-
-        var axisOffset = 0
-        for (axisIdx, axisDim) in axesDims.enumerated() {
-            let halfDim = axisDim / 2
-
-            var invFreq = [Double](repeating: 0, count: halfDim)
-            for k in 0..<halfDim {
-                let exponent = Double(2 * k) / Double(axisDim)
-                invFreq[k] = 1.0 / pow(Double(theta), exponent)
+    /// `img_ids` for in-graph RoPE: `[1, side*side, axisCount]` flattened row-major,
+    /// one row per image token as [T, H, W, L].
+    private func buildImageIds(side: Int, axisCount: Int) -> [Float] {
+        var ids = [Float](repeating: 0, count: side * side * axisCount)
+        for h in 0..<side {
+            for w in 0..<side {
+                let idx = h * side + w
+                ids[idx * axisCount + 1] = Float(h)
+                ids[idx * axisCount + 2] = Float(w)
             }
+        }
+        return ids
+    }
 
-            // Text tokens (first in sequence): axis 3 = sequential, others = 0
-            for s in 0..<textSeqLen {
-                let pos: Double = axisIdx == 3 ? Double(s) : 0.0
-                let outBase = s * totalDim + axisOffset
-                for k in 0..<halfDim {
-                    let angle = pos * invFreq[k]
-                    let c = Float(cos(angle))
-                    let sn = Float(sin(angle))
-                    cosScalars[outBase + 2 * k] = c
-                    cosScalars[outBase + 2 * k + 1] = c
-                    sinScalars[outBase + 2 * k] = sn
-                    sinScalars[outBase + 2 * k + 1] = sn
-                }
+    /// `img_ids` for img2img: noise tokens followed by reference tokens.
+    /// Reference rows carry T=10 on axis 0 so in-graph RoPE keeps them positionally
+    /// distinct from the noise grid even where H/W coincide.
+    private func buildImageIdsWithReference(
+        noiseSide: Int, refSide: Int, axisCount: Int
+    ) -> [Float] {
+        let noiseSeq = noiseSide * noiseSide
+        let refSeq = refSide * refSide
+        var ids = [Float](repeating: 0, count: (noiseSeq + refSeq) * axisCount)
+
+        for h in 0..<noiseSide {
+            for w in 0..<noiseSide {
+                let idx = h * noiseSide + w
+                ids[idx * axisCount + 1] = Float(h)
+                ids[idx * axisCount + 2] = Float(w)
             }
-
-            // Image tokens (after text): axis 1 = h, axis 2 = w, others = 0
-            for h in 0..<imgHeight {
-                for w in 0..<imgWidth {
-                    let s = textSeqLen + h * imgWidth + w
-                    let pos: Double
-                    switch axisIdx {
-                    case 1: pos = Double(h)
-                    case 2: pos = Double(w)
-                    default: pos = 0.0
-                    }
-                    let outBase = s * totalDim + axisOffset
-                    for k in 0..<halfDim {
-                        let angle = pos * invFreq[k]
-                        let c = Float(cos(angle))
-                        let sn = Float(sin(angle))
-                        cosScalars[outBase + 2 * k] = c
-                        cosScalars[outBase + 2 * k + 1] = c
-                        sinScalars[outBase + 2 * k] = sn
-                        sinScalars[outBase + 2 * k + 1] = sn
-                    }
-                }
-            }
-
-            axisOffset += axisDim
         }
 
-        return (cosScalars, sinScalars)
+        for h in 0..<refSide {
+            for w in 0..<refSide {
+                let idx = noiseSeq + h * refSide + w
+                ids[idx * axisCount + 0] = Self.referenceTokenTimeOffset
+                ids[idx * axisCount + 1] = Float(h)
+                ids[idx * axisCount + 2] = Float(w)
+            }
+        }
+
+        return ids
+    }
+
+    /// `txt_ids` for in-graph RoPE: `[1, textSeqLen, axisCount]` flattened row-major.
+    /// Text tokens are [0, 0, 0, s] — sequence index on the last axis, spatial unused.
+    private func buildTextIds(textSeqLen: Int, axisCount: Int) -> [Float] {
+        var ids = [Float](repeating: 0, count: textSeqLen * axisCount)
+        for s in 0..<textSeqLen {
+            ids[s * axisCount + (axisCount - 1)] = Float(s)
+        }
+        return ids
+    }
+
+    /// Spatially downsample packed tokens to a smaller grid, area-averaging each
+    /// `stride`×`stride` block channel-wise.
+    ///
+    /// Point sampling would keep only 1/stride² of the encoded reference and throw
+    /// the rest away; the block mean retains all of it, so structure survives at the
+    /// half/quarter grids. Channel index encodes intra-patch position, so averaging
+    /// per channel keeps corresponding sub-positions aligned.
+    /// Input: [fromSide*fromSide, channels], Output: [toSide*toSide, channels]
+    static func subsampleTokens(
+        _ tokens: [Float], fromSide: Int, toSide: Int, channels: Int
+    ) -> [Float] {
+        let stride = fromSide / toSide
+        let scale = 1.0 / Float(stride * stride)
+        var result = [Float](repeating: 0, count: toSide * toSide * channels)
+        for h in 0..<toSide {
+            for w in 0..<toSide {
+                let dstIdx = (h * toSide + w) * channels
+                for bh in 0..<stride {
+                    let srcRow = h * stride + bh
+                    for bw in 0..<stride {
+                        let srcIdx = (srcRow * fromSide + w * stride + bw) * channels
+                        for c in 0..<channels {
+                            result[dstIdx + c] += tokens[srcIdx + c]
+                        }
+                    }
+                }
+                for c in 0..<channels {
+                    result[dstIdx + c] *= scale
+                }
+            }
+        }
+        return result
+    }
+
+    // MARK: - Classifier-Free Guidance
+
+    /// `uncond + g*(cond - uncond)`, written into `destination` rather than returned.
+    ///
+    /// The caller reuses one buffer across denoising steps; at 1024×1024 each result is
+    /// ~2 MB, so returning a fresh array would allocate one per step.
+    static func applyClassifierFreeGuidance(
+        cond: ArraySlice<Float>, uncond: ArraySlice<Float>,
+        guidanceScale: Float, into destination: inout [Float]
+    ) {
+        // Reusing the buffer means a short input would leave the previous step's values
+        // in the tail rather than merely producing a short array, so require an exact fit.
+        precondition(
+            cond.count == destination.count && uncond.count == destination.count,
+            "CFG expected \(destination.count) noise values, got "
+                + "cond=\(cond.count) uncond=\(uncond.count)")
+        for (offset, (u, c)) in zip(uncond, cond).enumerated() {
+            destination[offset] = u + guidanceScale * (c - u)
+        }
     }
 
     // MARK: - Latent Packing/Unpacking

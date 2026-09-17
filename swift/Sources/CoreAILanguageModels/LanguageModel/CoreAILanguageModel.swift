@@ -40,11 +40,13 @@ public struct CoreAILanguageModel: LanguageModel {
     private let url: URL
     private let variant: String?
     private let kvCacheStrategy: KVCacheStrategy
+    private let prefillChunkSizeConfig: Int?
+    private let prefillChunkThresholdConfig: Int?
     fileprivate let samplingConfig: SamplingConfiguration
     fileprivate let bundle: LanguageBundle
     fileprivate let tokenizer: any Tokenizer
     fileprivate let thinkingFormat: ThinkTagParser.Format
-    fileprivate let toolCallMarkers: (open: String, close: String)?
+    fileprivate let toolCallDetection: ToolCallDetection?
     private let supportsToolCalling: Bool
     fileprivate let supportsReasoning: Bool
     fileprivate let resources: ModelResources
@@ -71,7 +73,9 @@ public struct CoreAILanguageModel: LanguageModel {
             kvCacheStrategy: kvCacheStrategy,
             modelIdentifier: bundle.name,
             samplingConfig: samplingConfig,
-            vocabSize: bundle.vocabSize
+            vocabSize: bundle.vocabSize,
+            prefillChunkSize: prefillChunkSizeConfig,
+            prefillChunkThreshold: prefillChunkThresholdConfig
         )
     }
 
@@ -92,13 +96,19 @@ public struct CoreAILanguageModel: LanguageModel {
     /// - Parameter kvCacheStrategy: KV cache memory strategy. Defaults to
     ///   `.auto` (256-token initial size for dynamic models). Pass
     ///   `.fixedSize` to pre-allocate at full `maxContextLength`.
+    /// - Parameter prefillChunkSize: Tokens per prefill chunk, or `nil`
+    ///   to use the model metadata or engine default.
+    /// - Parameter prefillChunkThreshold: Minimum prompt tokens to trigger
+    ///   chunking, or `nil` to use the model metadata or engine default.
     /// - Throws: If the asset bundle is invalid or the tokenizer fails to load.
     ///   With `.eager`, also throws on engine-creation failure.
     public init(
         resourcesAt url: URL,
         mode: LoadMode = .lazy,
         variant: String? = nil,
-        kvCacheStrategy: KVCacheStrategy = .auto
+        kvCacheStrategy: KVCacheStrategy = .auto,
+        prefillChunkSize: Int? = nil,
+        prefillChunkThreshold: Int? = nil
     ) async throws {
         let bundle = try LanguageBundle(at: url)
         let configuration = CoreAIExecutor.Configuration(
@@ -107,7 +117,9 @@ public struct CoreAILanguageModel: LanguageModel {
             kvCacheStrategy: kvCacheStrategy,
             modelIdentifier: bundle.name,
             samplingConfig: .greedy,
-            vocabSize: bundle.vocabSize
+            vocabSize: bundle.vocabSize,
+            prefillChunkSize: prefillChunkSize,
+            prefillChunkThreshold: prefillChunkThreshold
         )
         let resources = ModelResources.shared(for: configuration)
 
@@ -131,21 +143,23 @@ public struct CoreAILanguageModel: LanguageModel {
         tokenizer: any Tokenizer,
         resources: ModelResources
     ) {
-        let toolCallMarkers = CoreAIExecutor.detectToolCallMarkers(using: tokenizer)
-        let thinkingFormat = CoreAIExecutor.detectThinkingFormat(using: tokenizer)
+        let toolCallDetection = detectToolCallFormat(using: tokenizer)
+        let thinkingFormat = detectThinkingFormat(using: tokenizer)
         self.url = configuration.url
         self.variant = configuration.variant
         self.kvCacheStrategy = configuration.kvCacheStrategy
+        self.prefillChunkSizeConfig = configuration.prefillChunkSize
+        self.prefillChunkThresholdConfig = configuration.prefillChunkThreshold
         self.samplingConfig = configuration.samplingConfig
         self.bundle = bundle
         self.tokenizer = tokenizer
         self.thinkingFormat = thinkingFormat
-        self.toolCallMarkers = toolCallMarkers
-        self.supportsToolCalling = toolCallMarkers != nil
+        self.toolCallDetection = toolCallDetection
+        self.supportsToolCalling = toolCallDetection != nil
         self.supportsReasoning = {
             switch thinkingFormat {
             case .agentic: return true
-            case .tagPair(let open, _): return tokenizer.convertTokenToId(open) != nil
+            case .tagPair(let open, _): return tokenizer.vocabContains(open)
             }
         }()
         self.resources = resources
@@ -159,7 +173,7 @@ public struct CoreAILanguageModel: LanguageModel {
         // Agentic models: stop on <|eot|> (end of user-facing turn) so the
         // runner doesn't loop through repeated self→user cycles.
         if case .agentic(_, _, _, let eot) = thinkingFormat,
-            let eotId = tokenizer.convertTokenToId(eot)
+            let eotId = tokenizer.vocabContains(eot) ? tokenizer.convertTokenToId(eot) : nil
         {
             if !extraEos.contains(Int32(eotId)) {
                 extraEos.append(Int32(eotId))
@@ -185,15 +199,10 @@ public struct CoreAILanguageModel: LanguageModel {
         resources.unloadResources()
     }
 
-    /// Whether guided generation is available for this model.
+    /// Whether guided generation is available for this model. Assumes yes
+    /// before an engine is loaded.
     private var isGuidedGenerationSupported: Bool {
-        if let isConstrainedCapable = resources.loadedEngineIsConstrainedCapable {
-            return isConstrainedCapable
-        }
-        if let supportsLogits = resources.loadedEngineSupportsLogits {
-            return supportsLogits
-        }
-        return true
+        resources.loadedEngineSupportsGuidedGeneration ?? true
     }
 
     // MARK: - Executor
@@ -208,6 +217,8 @@ public struct CoreAILanguageModel: LanguageModel {
             let modelIdentifier: String
             let samplingConfig: SamplingConfiguration
             let vocabSize: Int?
+            let prefillChunkSize: Int?
+            let prefillChunkThreshold: Int?
         }
 
         // MARK: - Properties
@@ -218,72 +229,6 @@ public struct CoreAILanguageModel: LanguageModel {
 
         public init(configuration: Configuration) throws {
             self.resources = ModelResources.shared(for: configuration)
-        }
-
-        /// Probes the tokenizer for known reasoning formats. Supports both
-        /// tag-pair models (symmetric open/close markers) and agentic models
-        /// that use message routing for chain-of-thought.
-        static func detectThinkingFormat(
-            using tokenizer: any Tokenizer
-        ) -> ThinkTagParser.Format {
-            // Agentic format: to=self/to=user message routing with eom/eot
-            if tokenizer.convertTokenToId("<|eom|>") != nil,
-                tokenizer.convertTokenToId("<|eot|>") != nil,
-                tokenizer.convertTokenToId("<|message|>") != nil
-            {
-                return .agentic(
-                    selfMarker: "to=self<|message|>",
-                    userMarker: "to=user<|message|>",
-                    endOfMessage: "<|eom|>",
-                    endOfTurn: "<|eot|>"
-                )
-            }
-
-            // Tag-pair format: symmetric open/close markers
-            let candidates: [(open: String, close: String)] = [
-                ("<think>", "</think>"),
-                ("<|reasoning_start|>", "<|reasoning_end|>"),
-            ]
-            for pair in candidates {
-                if tokenizer.convertTokenToId(pair.open) != nil,
-                    tokenizer.convertTokenToId(pair.close) != nil
-                {
-                    return .tagPair(open: pair.open, close: pair.close)
-                }
-            }
-            return .tagPair(open: "<think>", close: "</think>")
-        }
-
-        /// Probes the tokenizer for known tool call marker pairs. Each
-        /// candidate tag-pair is verified to exist as special tokens via
-        /// `convertTokenToId(_:)`. Returns nil when the model's tokenizer
-        /// has no tool call tokens at all.
-        ///
-        /// Mistral uses `[TOOL_CALLS]` as a single special token with no
-        /// paired close token; `"\n"` is used as a synthetic close because
-        /// the JSON array is always emitted on a single line. The open marker
-        /// matches the bare token without a trailing space — `parseToolCalls`
-        /// already trims leading whitespace so optional spacing is handled.
-        fileprivate static func detectToolCallMarkers(
-            using tokenizer: any Tokenizer
-        ) -> (open: String, close: String)? {
-            // Standard tag-pair formats — both markers must be special tokens.
-            let tagPairs: [(open: String, close: String)] = [
-                ("<tool_call>", "</tool_call>"),
-                ("<function_calls>", "</function_calls>"),
-            ]
-            for pair in tagPairs
-            where tokenizer.convertTokenToId(pair.open) != nil
-                && tokenizer.convertTokenToId(pair.close) != nil
-            {
-                return pair
-            }
-            // Mistral: [TOOL_CALLS] is a special token but has no paired close token.
-            // Use "\n" as a synthetic close — the JSON array is always on a single line.
-            if tokenizer.convertTokenToId("[TOOL_CALLS]") != nil {
-                return (open: "[TOOL_CALLS]", close: "\n")
-            }
-            return nil
         }
 
         // MARK: - Prewarm (FoundationModels, synchronous)
@@ -333,7 +278,7 @@ public struct CoreAILanguageModel: LanguageModel {
 
                 // Check if guided generation is requested
                 if let schema = request.schema {
-                    guard engine.supportsLogits || engine is any ConstrainedGenerationCapable else {
+                    guard engine.supportsGuidedGeneration else {
                         throw LanguageModelError.unsupportedCapability(
                             .init(
                                 capability: .guidedGeneration,
@@ -406,8 +351,8 @@ public struct CoreAILanguageModel: LanguageModel {
             var thinkParser = ThinkTagParser(format: model.thinkingFormat)
             // Routes tool call markup to .toolCalls(...) channel events.
             // nil when the model's tokenizer has no tool call tokens.
-            var toolCallParser: ToolCallParser? = model.toolCallMarkers.map {
-                ToolCallParser(openMarker: $0.open, closeMarker: $0.close)
+            var toolCallParser: ToolCallParser? = model.toolCallDetection.map {
+                ToolCallParser(openMarker: $0.openMarker, closeMarker: $0.closeMarker, format: $0.format)
             }
             var generatedTokenCount: Int = 0
             var reasoningTokenCount: Int = 0

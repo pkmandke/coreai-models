@@ -6,7 +6,6 @@
 import CoreAI
 import CoreAIShared
 import Foundation
-import Synchronization
 
 // MARK: - Prefill Strategy
 
@@ -35,36 +34,34 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
 
     public var supportsLogits: Bool { true }
     public var vocabSize: Int { config.vocabSize }
+    public var hasRecurrentState: Bool { hasNonTruncatableStates }
     public let config: ModelConfig
 
     // Core AI function handle
     private let function: InferenceFunction
     private let functionDescriptor: InferenceFunctionDescriptor
 
+    // Optional prefill graph. Prefill chunks run here when the asset has it. It produces
+    // no logits, so the last prompt token still goes through `function`.
+    private let prefillFunction: InferenceFunction?
+
     // I/O names from descriptor
-    private let inputIdsName: String
-    private let positionIdsName: String
     private let logitsName: String
+
+    // Input handling — handler owns allocation and fill logic
+    private var inputHandler: TokenInputHandler
 
     // State management — handlers own allocation, growth, and reset
     private var kvCache: any SyncStateHandler
     private var additionalStates: FixedNDArrayState?
     private var hasNonTruncatableStates: Bool
 
-    // Descriptors for dynamic shape resolution
-    private let inputIdsDescriptor: NDArrayDescriptor
-    private let positionIdsDescriptor: NDArrayDescriptor
+    // Logits descriptor and buffer
     private let logitsDescriptor: NDArrayDescriptor
-
-    // Persistent state — reused across steps
     private var logitsArray: NDArray
-    // Pre-allocated input_ids reused across decode steps. Only reallocated when
-    // batch size changes (i.e., once when transitioning from prefill to decode).
-    // Saves ~50-100 µs/step worth of `NDArray(descriptor:)` + descriptor resolve
-    // work in the steady state.
-    private var inputIdsArray: NDArray
-    private var cachedInputBatchSize: Int
     private var cachedLogitsBatchSize: Int
+
+    // Ring buffer mode: handled by TokenInputHandler.useCompactPositionIds
 
     // Track processed tokens for incremental inference
     public private(set) var processedTokenCount: Int = 0
@@ -74,14 +71,14 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
     public private(set) var lastPrefixHitCount: Int = 0
 
     // Track in-flight generation via token (replaces simple bool lock)
-    private let _activeToken = Mutex<GenerationToken?>(nil)
+    private let tokenBox = GenerationTokenBox()
 
-    public var isBusy: Bool { _activeToken.withLock { $0 != nil } }
+    public var isBusy: Bool { tokenBox.isBusy }
 
     /// Clear the engine's active token if it matches the given token.
     /// Called by the iterator when generation finishes or is cancelled.
     func clearTokenIfActive(_ token: GenerationToken) {
-        _activeToken.withLock { if $0 === token { $0 = nil } }
+        tokenBox.clearIfActive(token)
     }
 
     // MARK: - Init
@@ -123,32 +120,6 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
                     + "states=\(descriptor.stateNames), outputs=\(descriptor.outputNames)")
         }
 
-        // Extract names
-        self.inputIdsName = descriptor.inputNames[0]
-        self.positionIdsName = descriptor.inputNames[1]
-        self.logitsName = descriptor.outputNames[0]
-
-        // Extract and validate input descriptors
-        guard case .ndArray(let inputIdsDesc) = descriptor.inputDescriptor(of: inputIdsName) else {
-            throw InferenceRuntimeError.invalidInputType("Cannot get descriptor for '\(inputIdsName)'")
-        }
-        self.inputIdsDescriptor = inputIdsDesc
-
-        guard case .ndArray(let posIdsDesc) = descriptor.inputDescriptor(of: positionIdsName) else {
-            throw InferenceRuntimeError.invalidInputType("Cannot get descriptor for '\(positionIdsName)'")
-        }
-        self.positionIdsDescriptor = posIdsDesc
-
-        // Extract and validate logits descriptor
-        guard case .ndArray(let logitsDesc) = descriptor.outputDescriptor(of: logitsName) else {
-            throw InferenceRuntimeError.invalidOutputType("Cannot get descriptor for '\(logitsName)'")
-        }
-        guard logitsDesc.scalarType == .float16 else {
-            throw InferenceRuntimeError.unsupportedLogitsType(
-                "Only float16 logits supported, got \(logitsDesc.scalarType)")
-        }
-        self.logitsDescriptor = logitsDesc
-
         // Create state handlers from descriptor
         let stateHandlers = try StateHandlerFactory.createSyncHandlers(
             descriptor: descriptor,
@@ -158,6 +129,39 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
         self.kvCache = stateHandlers.kvCache
         self.additionalStates = stateHandlers.additionalStates
         self.hasNonTruncatableStates = stateHandlers.hasNonTruncatableStates
+
+        let layout = try InputLayout.analyze(
+            model: model, functionName: config.function, config: config,
+            useCompactPositionIds: stateHandlers.isAllSlidingCache)
+
+        self.logitsName = layout.logitsName
+        let inputIdsName = layout.inputIdsName
+        let positionIdsName = layout.positionIdsName
+
+        // Create input handler from descriptors
+        guard case .ndArray(let inputIdsDesc) = descriptor.inputDescriptor(of: inputIdsName) else {
+            throw InferenceRuntimeError.invalidInputType("Cannot get descriptor for '\(inputIdsName)'")
+        }
+        guard case .ndArray(let posIdsDesc) = descriptor.inputDescriptor(of: positionIdsName) else {
+            throw InferenceRuntimeError.invalidInputType("Cannot get descriptor for '\(positionIdsName)'")
+        }
+
+        guard case .ndArray(let logitsDesc) = descriptor.outputDescriptor(of: logitsName) else {
+            throw InferenceRuntimeError.invalidOutputType("Cannot get descriptor for '\(logitsName)'")
+        }
+        guard logitsDesc.scalarType == .float16 else {
+            throw InferenceRuntimeError.unsupportedLogitsType(
+                "Only float16 logits supported, got \(logitsDesc.scalarType)")
+        }
+        self.logitsDescriptor = logitsDesc
+
+        self.inputHandler = TokenInputHandler(
+            inputIdsName: inputIdsName,
+            positionIdsName: positionIdsName,
+            inputIdsDescriptor: inputIdsDesc,
+            positionIdsDescriptor: posIdsDesc,
+            useCompactPositionIds: layout.positionPolicy == .compact
+        )
 
         CLILogger.log(
             "KV cache: capacity=\(kvCache.currentCapacity), states=\(kvCache.stateNames)"
@@ -172,13 +176,13 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
         self.logitsArray = NDArray(descriptor: initLogitsDesc)
         self.cachedLogitsBatchSize = 1
 
-        // Allocate initial input_ids ([1, 1] — decode steady state). Will be
-        // reallocated on first prefill if batch != 1.
-        let initInputDesc = inputIdsDesc.resolvingDynamicDimensions([1, 1])
-        self.inputIdsArray = NDArray(descriptor: initInputDesc)
-        self.cachedInputBatchSize = 1
-
         // Load inference function
+        self.prefillFunction = try loadPrefillGraph(
+            from: model, matching: descriptor, mainName: config.function)
+        if self.prefillFunction != nil {
+            CLILogger.log("Found '\(prefillGraphFunctionName)' graph — prefill skips the LM head")
+        }
+
         guard let fn = try model.loadFunction(named: config.function) else {
             throw InferenceRuntimeError.genericError(
                 "Cannot load function '\(config.function)'")
@@ -209,7 +213,13 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
     // MARK: - Prefill Strategy
 
     private func selectPrefillStrategy(newTokenCount: Int) -> PrefillStrategy {
-        if newTokenCount > config.chunkThreshold {
+        // With a prefill graph, chunking is cheaper at any size: every chunk but the last
+        // token skips the LM head, so there is no threshold to clear.
+        if shouldChunkPrefill(
+            tokenCount: newTokenCount,
+            hasPrefillGraph: prefillFunction != nil,
+            chunkThreshold: config.chunkThreshold)
+        {
             return .chunked(chunkSize: config.prefillChunkSize)
         }
         return .wholeBatch
@@ -231,23 +241,8 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
             details: "\(batchSize) tokens at position \(processedTokenCount)"
         )
 
-        // Reuse pre-allocated input_ids when the batch size is unchanged.
-        // Steady-state decode keeps batchSize=1 forever, so this avoids the
-        // `NDArray(descriptor:)` + `resolvingDynamicDimensions` work on every
-        // step — small per call, but compounds over long generations.
-        if cachedInputBatchSize != batchSize {
-            let resolvedInputDesc = inputIdsDescriptor.resolvingDynamicDimensions([1, batchSize])
-            inputIdsArray = NDArray(descriptor: resolvedInputDesc)
-            cachedInputBatchSize = batchSize
-        }
-        fillNDArray(&inputIdsArray, as: Int32.self, with: tokens)
-
-        // Build position_ids: [0, 1, ..., processedTokenCount + batchSize - 1]
-        // Shape grows by 1 each step, so we can't easily pre-allocate this one.
-        let totalPositions = processedTokenCount + batchSize
-        let resolvedPosDesc = positionIdsDescriptor.resolvingDynamicDimensions([1, totalPositions])
-        var positionIds = NDArray(descriptor: resolvedPosDesc)
-        fillNDArray(&positionIds, as: Int32.self, count: totalPositions) { Int32($0) }
+        let context = InputContext.dynamic(tokens: tokens, processedTokenCount: processedTokenCount)
+        let inputs = try await inputHandler.prepare(context)
 
         // Reuse pre-allocated logits when the batch size is unchanged.
         if cachedLogitsBatchSize != batchSize {
@@ -259,7 +254,7 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
         // Bind states, build output views, and execute
         try await runWithStates(
             function: function,
-            inputs: [inputIdsName: inputIdsArray, positionIdsName: positionIds],
+            inputs: inputs,
             primary: kvCache,
             secondary: additionalStates,
             outputArray: &logitsArray,
@@ -280,43 +275,82 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
         return logitBuffer
     }
 
+    /// Run one prefill chunk on the prefill graph: KV cache writes only, no logits.
+    private func encodePrefillChunk(
+        _ tokens: ArraySlice<Int32>, using prefillFn: InferenceFunction
+    ) async throws {
+        let batchSize = tokens.count
+        _ = try kvCache.ensureCapacity(forContextLength: processedTokenCount + batchSize)
+
+        let context = InputContext.dynamic(tokens: tokens, processedTokenCount: processedTokenCount)
+        let inputs = try await inputHandler.prepare(context)
+
+        try await runWithStatesNoOutputs(
+            function: prefillFn,
+            inputs: inputs,
+            primary: kvCache,
+            secondary: additionalStates)
+
+        processedTokenCount += batchSize
+    }
+
     // MARK: - Chunked Prefill
 
     private func processChunkedPrompt(
         tokens: ArraySlice<Int32>,
         chunkSize: Int
     ) async throws -> [LogitsScalarType] {
-        let totalChunks = (tokens.count + chunkSize - 1) / chunkSize
+        // The prefill graph produces no logits, so hold the final token back for
+        // `function`: it is the one whose logits seed sampling. Without one, nothing is
+        // held back and the trailing chunk carries the logits.
+        let heldBack = prefillHeldBackTokens(hasPrefillGraph: prefillFunction != nil)
 
         let chunkSignpost = InstrumentsProfiler.beginCustomInterval(
             name: "CoreAIClean Chunked Prefill",
-            details: "\(tokens.count) tokens in \(totalChunks) chunks of \(chunkSize)"
+            details: "\(tokens.count) tokens, chunkSize \(chunkSize)"
         )
+        defer {
+            InstrumentsProfiler.endCustomInterval(
+                name: "CoreAIClean Chunked Prefill",
+                signpostID: chunkSignpost
+            )
+        }
 
-        var lastLogits: [LogitsScalarType] = []
+        return try await runChunkedPrefill(
+            tokens: tokens,
+            chunkSize: chunkSize,
+            heldBack: heldBack,
+            vocabSize: config.vocabSize
+        ) { chunk, isHeldBack in
+            // Held-back tail (and every chunk when there is no prefill graph) runs through
+            // `main` for logits; earlier chunks fill the KV cache via the prefill graph.
+            if !isHeldBack, let prefillFn = self.prefillFunction {
+                try await self.encodePrefillChunk(chunk, using: prefillFn)
+                return []
+            }
+            return try await self.processTokenBatch(chunk)
+        }
+    }
+
+    /// Process tokens in chunks, returning ALL position logits (not just last token).
+    /// Used for batched PPL evaluation where every position's logits are needed.
+    func processChunkedPromptAllLogits(
+        tokens: ArraySlice<Int32>,
+        chunkSize: Int
+    ) async throws -> [LogitsScalarType] {
+        var allLogits: [LogitsScalarType] = []
         var remainingTokens = tokens
-        var chunkIndex = 0
 
         while !remainingTokens.isEmpty {
             let currentChunkSize = min(chunkSize, remainingTokens.count)
             let chunkEnd = remainingTokens.startIndex + currentChunkSize
             let chunk = remainingTokens[remainingTokens.startIndex..<chunkEnd]
-
-            CLILogger.log(
-                "Chunk \(chunkIndex + 1)/\(totalChunks): \(chunk.count) tokens at position \(processedTokenCount)"
-            )
-
-            lastLogits = try await processTokenBatch(chunk)
+            let chunkLogits = try await processTokenBatch(chunk)
+            allLogits.append(contentsOf: chunkLogits)
             remainingTokens = remainingTokens[chunkEnd...]
-            chunkIndex += 1
         }
 
-        InstrumentsProfiler.endCustomInterval(
-            name: "CoreAIClean Chunked Prefill",
-            signpostID: chunkSignpost
-        )
-
-        return lastTokenLogits(from: lastLogits, vocabSize: config.vocabSize)
+        return allLogits
     }
 
     // MARK: - Generate (primary API)
@@ -327,10 +361,7 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
         inferenceOptions: InferenceOptions
     ) async throws -> GenerationSequence {
         // Cancel any prior generation so its Iterator stops on next poll.
-        _activeToken.withLock {
-            $0?.cancel()
-            $0 = nil
-        }
+        tokenBox.cancelActive()
 
         // Implicit prefix caching: resolve input against history.
         // For hybrid models with recurrent states, we must full-reset on any
@@ -360,7 +391,7 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
         }
 
         let token = GenerationToken()
-        _activeToken.withLock { $0 = token }
+        tokenBox.install(token)
         return GenerationSequence(
             engine: self,
             input: input,
@@ -375,7 +406,7 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
     /// Wait for any in-flight generate() Task to finish.
     private func drain() {
         var attempts = 0
-        while _activeToken.withLock({ $0 != nil }) {
+        while tokenBox.isBusy {
             attempts += 1
             if attempts > 5000 {
                 fatalError("Sequential engine drain() timeout — generation Task stuck?")
@@ -385,10 +416,7 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
     }
 
     public func cancel() async throws {
-        _activeToken.withLock {
-            $0?.cancel()
-            $0 = nil
-        }
+        tokenBox.cancelActive()
     }
 
     public func reset(to tokenIndex: Int) async throws {
@@ -400,10 +428,7 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
                 "Partial reset is not supported for hybrid models with recurrent state. "
                     + "Use reset(to: 0) and replay the prefix.")
         }
-        _activeToken.withLock {
-            $0?.cancel()
-            $0 = nil
-        }
+        tokenBox.cancelActive()
         internalReset(to: tokenIndex)
     }
 
@@ -483,6 +508,9 @@ extension CoreAISequentialEngine.GenerationSequence {
         private let generationStartOffset: Int
         private var step: Int = 0
         private var finished: Bool = false
+        // Pre-computed logits for batched forcedContinuation evaluation.
+        // When non-nil, next() yields from this buffer instead of running inference.
+        private var batchedLogitsBuffer: [[LogitsScalarType]]?
 
         init(
             engine: CoreAISequentialEngine,
@@ -528,6 +556,66 @@ extension CoreAISequentialEngine.GenerationSequence {
                 stopReasonStore.setIfUnset(.maxTokens)
                 finishAndRelease()
                 return nil
+            }
+
+            // Fast path: batched forcedContinuation with logits.
+            // All tokens were processed in one prefill; yield pre-computed logits.
+            if let buffer = batchedLogitsBuffer {
+                let logits = buffer[step]
+                let token = forcedContinuation![step]
+                step += 1
+                if step >= maxTokens {
+                    stopReasonStore.setIfUnset(.maxTokens)
+                    finishAndRelease()
+                }
+                return InferenceOutput(tokenId: token, logits: logits)
+            }
+
+            // First call with forcedContinuation + logits: batch-process all tokens at once.
+            if let forced = forcedContinuation, returnsLogits, step == 0 {
+                let allTokens = inputTokens + forced.map { $0 }
+                let vocabSize = engine.config.vocabSize
+
+                let allLogits: [LogitsScalarType]
+                let strategy = engine.selectPrefillStrategy(newTokenCount: allTokens.count)
+                switch strategy {
+                case .chunked(let chunkSize):
+                    allLogits = try await engine.processChunkedPromptAllLogits(
+                        tokens: allTokens[...], chunkSize: chunkSize)
+                case .wholeBatch:
+                    allLogits = try await engine.processTokenBatch(allTokens[...])
+                case .oneAtATime:
+                    var collected: [LogitsScalarType] = []
+                    for j in allTokens.indices {
+                        collected.append(contentsOf: try await engine.processTokenBatch(allTokens[j...j]))
+                    }
+                    allLogits = collected
+                }
+
+                // Split into per-position logit vectors.
+                // Skip the prompt positions (inputTokens.count - 1 positions);
+                // we want logits that predict each forced token.
+                let promptLen = inputTokens.count
+                var buffer: [[LogitsScalarType]] = []
+                for i in 0..<forced.count {
+                    let offset = (promptLen - 1 + i) * vocabSize
+                    let endOffset = offset + vocabSize
+                    guard endOffset <= allLogits.count else {
+                        throw InferenceRuntimeError.invalidState(
+                            "Batched logits underflow at position \(i): need \(endOffset), got \(allLogits.count)")
+                    }
+                    buffer.append(Array(allLogits[offset..<endOffset]))
+                }
+                batchedLogitsBuffer = buffer
+
+                // Update engine state
+                engine.history.append(contentsOf: allTokens[...])
+
+                // Yield first result
+                let logits = buffer[step]
+                let token = forced[step]
+                step += 1
+                return InferenceOutput(tokenId: token, logits: logits)
             }
 
             do {

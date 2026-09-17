@@ -16,14 +16,14 @@ import Foundation
 /// **Agentic**: multi-turn message routing where reasoning
 /// is emitted as `to=self` messages and responses as `to=user` messages,
 /// delimited by message boundary tokens.
-struct ThinkTagParser {
-    enum Event {
+public struct ThinkTagParser {
+    public enum Event {
         case text(String)
         case reasoning(String)
     }
 
     /// Format configuration for the parser.
-    enum Format {
+    public enum Format: Sendable {
         /// Symmetric open/close tag pair (e.g. `<think>`/`</think>`).
         case tagPair(open: String, close: String)
 
@@ -39,18 +39,18 @@ struct ThinkTagParser {
     private var buffer: String = ""
     private var insideThink: Bool = false
 
-    init(open: String = "<think>", close: String = "</think>") {
+    public init(open: String = "<think>", close: String = "</think>") {
         self.format = .tagPair(open: open, close: close)
     }
 
-    init(format: Format) {
+    public init(format: Format) {
         self.format = format
         if case .agentic = format {
             self.insideThink = true
         }
     }
 
-    mutating func consume(_ delta: String) -> [Event] {
+    public mutating func consume(_ delta: String) -> [Event] {
         buffer.append(delta)
         switch format {
         case .tagPair:
@@ -60,7 +60,7 @@ struct ThinkTagParser {
         }
     }
 
-    mutating func flush() -> [Event] {
+    public mutating func flush() -> [Event] {
         switch format {
         case .tagPair:
             return drainTagPair(isFinal: true)
@@ -106,22 +106,83 @@ struct ThinkTagParser {
 
     // MARK: - Agentic mode
 
+    /// Try to consume a routing header at the start of the buffer.
+    /// Returns true if a header was consumed, setting `insideThink` accordingly.
+    ///
+    /// Handles two prefix variants:
+    /// - First turn: ` to=<target><|message|>` (leading space, no `<|start|>`)
+    /// - Subsequent segments: `<|start|>assistant to=<target><|message|>`
+    ///
+    /// Non-destructive on failure: saves and restores buffer if no complete
+    /// routing header is matched.
+    private mutating func consumeEntryMarker(
+        selfMarker: String, userMarker: String, messageToken: String
+    ) -> Bool {
+        let saved = buffer
+
+        if buffer.hasPrefix(" to=") {
+            buffer.removeFirst()
+        }
+
+        let headerPrefix = "<|start|>assistant "
+        if buffer.hasPrefix(headerPrefix) {
+            buffer = String(buffer.dropFirst(headerPrefix.count))
+        }
+
+        if buffer.hasPrefix(selfMarker) {
+            buffer = String(buffer.dropFirst(selfMarker.count))
+            insideThink = true
+            return true
+        }
+        if buffer.hasPrefix(userMarker) {
+            buffer = String(buffer.dropFirst(userMarker.count))
+            insideThink = false
+            return true
+        }
+        if buffer.hasPrefix("to="),
+            let range = buffer.range(of: messageToken)
+        {
+            buffer = String(buffer[range.upperBound...])
+            insideThink = false
+            return true
+        }
+
+        buffer = saved
+        return false
+    }
+
+    /// Returns true if the buffer could be the start of a routing header that
+    /// hasn't fully arrived yet during streaming.
+    private func isPartialRoutingHeader() -> Bool {
+        if buffer.isEmpty { return false }
+        let headerPrefix = "<|start|>assistant "
+        if headerPrefix.hasPrefix(buffer) { return true }
+        if buffer.hasPrefix(headerPrefix) && buffer.range(of: "<|message|>") == nil {
+            return true
+        }
+        if buffer.hasPrefix("to=") && buffer.range(of: "<|message|>") == nil {
+            return true
+        }
+        if " to=".hasPrefix(buffer) { return true }
+        if buffer.hasPrefix(" to=") && buffer.range(of: "<|message|>") == nil {
+            return true
+        }
+        return false
+    }
+
     private mutating func drainAgentic(isFinal: Bool) -> [Event] {
         guard case .agentic(let selfMarker, let userMarker, let eom, let eot) = format else {
             return []
         }
+        let messageToken = "<|message|>"
 
         var events: [Event] = []
         while true {
-            // Entry markers may arrive across consume() boundaries — strip them
-            // at the top of each iteration before searching for end markers.
-            if buffer.hasPrefix(selfMarker) {
-                buffer = String(buffer.dropFirst(selfMarker.count))
-                insideThink = true
-            } else if buffer.hasPrefix(userMarker) {
-                buffer = String(buffer.dropFirst(userMarker.count))
-                insideThink = false
+            if !isFinal && isPartialRoutingHeader() {
+                return events
             }
+
+            _ = consumeEntryMarker(selfMarker: selfMarker, userMarker: userMarker, messageToken: messageToken)
 
             if insideThink {
                 if let range = buffer.range(of: eom) {
@@ -129,13 +190,6 @@ struct ThinkTagParser {
                     if !before.isEmpty { events.append(.reasoning(before)) }
                     buffer = String(buffer[range.upperBound...])
                     insideThink = false
-                    // Consume the following entry marker if present
-                    if buffer.hasPrefix(selfMarker) {
-                        buffer = String(buffer.dropFirst(selfMarker.count))
-                        insideThink = true
-                    } else if buffer.hasPrefix(userMarker) {
-                        buffer = String(buffer.dropFirst(userMarker.count))
-                    }
                 } else if let range = buffer.range(of: userMarker) {
                     let before = String(buffer[buffer.startIndex..<range.lowerBound])
                     if !before.isEmpty { events.append(.reasoning(before)) }
@@ -151,13 +205,6 @@ struct ThinkTagParser {
                     if !before.isEmpty { events.append(.text(before)) }
                     buffer = String(buffer[range.upperBound...])
                     insideThink = true
-                    // Consume the following entry marker if present
-                    if buffer.hasPrefix(userMarker) {
-                        buffer = String(buffer.dropFirst(userMarker.count))
-                        insideThink = false
-                    } else if buffer.hasPrefix(selfMarker) {
-                        buffer = String(buffer.dropFirst(selfMarker.count))
-                    }
                 } else if let range = buffer.range(of: selfMarker) {
                     let before = String(buffer[buffer.startIndex..<range.lowerBound])
                     if !before.isEmpty { events.append(.text(before)) }
@@ -201,5 +248,44 @@ struct ThinkTagParser {
             }
         }
         return buffer.endIndex
+    }
+
+    /// Strip all completed thinking blocks from a full string.
+    /// Unclosed blocks at the end are also removed.
+    public static func stripCompleted(
+        from text: String, open: String = "<think>", close: String = "</think>"
+    ) -> String {
+        var result = ""
+        result.reserveCapacity(text.count)
+        var remaining = text[...]
+        while let startRange = remaining.range(of: open) {
+            result.append(contentsOf: remaining[remaining.startIndex..<startRange.lowerBound])
+            if let endRange = remaining.range(of: close, range: startRange.upperBound..<remaining.endIndex) {
+                remaining = remaining[endRange.upperBound...]
+            } else {
+                // Unclosed block — discard everything from here
+                return result
+            }
+        }
+        result.append(contentsOf: remaining)
+        return result
+    }
+
+    /// Strip reasoning content for a given format (handles both tag-pair and agentic).
+    public static func stripReasoning(from text: String, format: Format) -> String {
+        switch format {
+        case .tagPair(let open, let close):
+            return stripCompleted(from: text, open: open, close: close)
+        case .agentic(let selfMarker, let userMarker, let eom, let eot):
+            var parser = ThinkTagParser(
+                format: .agentic(
+                    selfMarker: selfMarker, userMarker: userMarker,
+                    endOfMessage: eom, endOfTurn: eot))
+            let events = parser.consume(text) + parser.flush()
+            return events.compactMap { event -> String? in
+                if case .text(let t) = event { return t }
+                return nil
+            }.joined()
+        }
     }
 }

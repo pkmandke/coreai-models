@@ -12,9 +12,12 @@ using the coreai-opt library, including calibration data preparation.
 
 import logging
 from collections.abc import Callable, Sequence
+from typing import Any
 
 import torch
 import torch.nn as nn
+from datasets import load_dataset
+from tqdm import tqdm
 
 from coreai_models._constants import (
     MAIN_GRAPH_NAME,
@@ -38,14 +41,6 @@ try:
 except ImportError:
     _HAS_COREAI_OPT = False
 
-try:
-    from datasets import load_dataset
-    from tqdm import tqdm
-
-    _HAS_DATASETS = True
-except ImportError:
-    _HAS_DATASETS = False
-
 
 def _require_coreai_opt() -> None:
     """Raise if coreai_opt is not installed."""
@@ -53,6 +48,35 @@ def _require_coreai_opt() -> None:
         raise ImportError(
             "coreai-opt is required for model compression. Install it with: pip install coreai-opt"
         )
+
+
+def is_compression_mode_graph(quantization_config: dict) -> bool:
+    """Whether ``quantization_config`` selects coreai-opt's graph execution mode.
+
+    Args:
+        quantization_config: coreai-opt's ``quantization_config`` dict.
+    """
+    _require_coreai_opt()
+    execution_mode = quantization_config.get("execution_mode")
+    return execution_mode is not None and ExecutionMode(execution_mode) == ExecutionMode.GRAPH
+
+
+def split_compression_config(
+    compression_config_object: Any,
+) -> "tuple[dict | None, KMeansPalettizerConfig | None]":
+    """Route a prebuilt coreai-opt config to its quantization or palettization slot.
+
+    Args:
+        compression_config_object: A config loaded from a user-provided YAML.
+
+    Returns:
+        ``(quantization_config, palettization_config)``, exactly one of which is
+        non-``None``.
+    """
+    _require_coreai_opt()
+    if isinstance(compression_config_object, KMeansPalettizerConfig):
+        return None, compression_config_object
+    return compression_config_object, None
 
 
 def get_c4(
@@ -75,11 +99,6 @@ def get_c4(
         List of tokenized samples, each of shape (1, seq_len) where
         seq_len <= max_sequence_length.
     """
-    if not _HAS_DATASETS:
-        raise ImportError(
-            "The 'datasets' and 'tqdm' packages are required for calibration data. "
-            "Install them with: pip install datasets tqdm"
-        )
 
     dataset = load_dataset(
         "allenai/c4",
@@ -212,8 +231,6 @@ def quantize_pytorch_model(
     prepared_model = quantizer.prepare(example_inputs=inputs, dynamic_shapes=dynamic_shapes)
 
     if run_calibration:
-        if not _HAS_DATASETS:
-            raise ImportError("tqdm is required for calibration progress reporting.")
         logger.info(f"Running calibration with {len(calibration_data) - 1} samples on {device}")
         with quantizer.calibration_mode(), torch.no_grad():
             for sample in tqdm(calibration_data[1:], desc="calibration"):
@@ -239,6 +256,8 @@ def quantize_for_export(
     quantization_config: dict,
     calibration_data_fn: Callable[[], list] | None = None,
     mmap_dir: str | None = None,
+    spec: TraceSpec | None = None,
+    export_backend: object | None = None,
 ) -> nn.Module:
     """Apply pre-export torch quantization using the model's own graph contract.
 
@@ -254,8 +273,12 @@ def quantize_for_export(
         calibration_data_fn: Calibration samples; required when the recipe enables
             ``calibrate_activations``.
         mmap_dir: Directory for the quantizer's disk checkpointing.
+        spec: Trace shapes. Defaults to a trace bounded at ``TRACE_KV_CACHE_SEQ_LEN``.
+        export_backend: Backend for the finalized model; see ``quantize_pytorch_model``.
+            Defaults to the CoreAI backend.
     """
-    spec = TraceSpec(max_context_length=TRACE_KV_CACHE_SEQ_LEN)
+    if spec is None:
+        spec = TraceSpec(max_context_length=TRACE_KV_CACHE_SEQ_LEN)
     reference_inputs = model.build_reference_inputs(config, target_dtype, spec)
     dynamic_shapes = model.build_dynamic_shapes(config, spec)
     # Same check the export path runs, so a bad contract fails identically on both.
@@ -295,6 +318,7 @@ def quantize_for_export(
         mmap_dir=mmap_dir,
         cache_seq_len=spec.cache_seq_len,
         state_indices=state_indices,
+        export_backend=export_backend,
     )
 
 

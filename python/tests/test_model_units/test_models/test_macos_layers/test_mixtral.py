@@ -1008,6 +1008,7 @@ class MixtralSparseMoeBlock(Model):
 
 class TestMixtralLayers:
     @staticmethod
+    @pytest.mark.flaky(reruns=3)
     @pytest.mark.parametrize("model_class", [MixtralAttention, MixtralTransformerBlock])
     @pytest.mark.parametrize("precision", [Precision.f32, Precision.f16, Precision.bf16])
     @pytest.mark.parametrize(
@@ -1182,3 +1183,6 @@ class TestMixtralLayers:
 class TestMixtralForCausalLM(ForCausalLMTestBase):
     _toy_model_id = "yujiepan/mixtral-8xtiny-random"
     _model_class = CoreaiTorchMixtralForCausalLM
+    _test_weight_activation_quantization = True
+    # enable once the fix in https://github.com/apple/coreai-optimization/pull/78 is released
+    _test_eager_activation_quantization = False

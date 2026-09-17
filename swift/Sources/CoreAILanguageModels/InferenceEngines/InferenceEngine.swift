@@ -143,6 +143,15 @@ public protocol InferenceEngine: Sendable {
     /// Useful for debugging multi-turn efficiency and verifying prefix caching behavior.
     var lastPrefixHitCount: Int { get }
 
+    /// Whether the engine carries recurrent state (SSM / hybrid models).
+    ///
+    /// Recurrent/conv states summarize the entire prefix and cannot be truncated
+    /// by moving a KV cursor, so token-prefix reuse is impossible: on any rewind
+    /// the engine full-resets and replays the whole prompt. Callers (e.g. the
+    /// server's prefix-reuse accounting) should short-circuit when this is true.
+    /// Defaults to `false`.
+    var hasRecurrentState: Bool { get }
+
     // MARK: - Configuration
 
     associatedtype ConfigType: Codable, InferenceConfiguration
@@ -152,31 +161,37 @@ public protocol InferenceEngine: Sendable {
 public protocol InferenceConfiguration: Sendable {
     var maxContextLength: Int { get }
 
-    /// Size for prefill chunks. Override in conforming types if needed.
+    /// Tokens per prefill chunk. Override in conforming types if needed.
     var prefillChunkSize: Int { get }
 
-    /// Minimum prompt size to trigger chunked processing.
-    /// Prompts smaller than this are processed in a single pass.
-    /// Default: 1024 tokens.
+    /// Minimum prompt length (in tokens) to trigger chunked processing.
+    /// Prompts at or below this length are processed in a single pass.
     var chunkThreshold: Int { get }
 }
 
-extension InferenceConfiguration {
-    /// Default prefill chunk size: 512 tokens.
-    ///
-    /// Trade-off: smaller = less memory but more overhead.
-    ///
-    /// ## Memory Calculation
-    /// Logits buffer = batch × seqLen × vocabSize × sizeof(Float16)
-    ///
-    /// Example with Qwen3 (vocab_size = 151,936):
-    /// - 32K prompt without chunking: 1 × 32,768 × 151,936 × 2 = **9.6 GB**
-    /// - 512-token chunk:             1 × 512 × 151,936 × 2 = **155 MB** (98% reduction)
-    public var prefillChunkSize: Int { 512 }
+/// Memory-based default prefill chunk size.
+///
+/// Larger machines can afford bigger chunks (less overhead per prefill),
+/// while smaller machines need smaller chunks to keep peak memory in check.
+///
+/// ## Memory Calculation
+/// Logits buffer = batch × seqLen × vocabSize × sizeof(Float16)
+///
+/// Example with Qwen3 (vocab_size = 151,936):
+/// - 32K prompt without chunking: 1 × 32,768 × 151,936 × 2 = **9.6 GB**
+/// - 2048-token chunk:            1 × 2,048 × 151,936 × 2 = **620 MB** (94% reduction)
+func defaultPrefillChunkSize() -> Int {
+    let bytes = ProcessInfo.processInfo.physicalMemory
+    let gb = bytes / (1024 * 1024 * 1024)
+    if gb <= 24 { return 2048 }
+    return 4096
+}
 
-    /// Default chunk threshold: 1024 tokens.
-    /// Prompts <= 1024 tokens are processed in a single pass.
-    public var chunkThreshold: Int { 1024 }
+extension InferenceConfiguration {
+    public var prefillChunkSize: Int { defaultPrefillChunkSize() }
+
+    /// Default threshold: 2× chunk size.
+    public var chunkThreshold: Int { prefillChunkSize * 2 }
 }
 
 // MARK: - Default Implementations
@@ -188,8 +203,21 @@ extension InferenceEngine {
 }
 
 extension InferenceEngine {
+    /// Guided/structured generation needs either per-step logits (CPU-side
+    /// constrained decoding) or GPU-side constrained sampling
+    /// (`ConstrainedGenerationCapable`).
+    public var supportsGuidedGeneration: Bool {
+        supportsLogits || self is any ConstrainedGenerationCapable
+    }
+}
+
+extension InferenceEngine {
     /// Default: no prefix hits (engine doesn't track history).
     public var lastPrefixHitCount: Int { 0 }
+}
+
+extension InferenceEngine {
+    public var hasRecurrentState: Bool { false }
 }
 
 extension InferenceEngine {

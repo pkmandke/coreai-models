@@ -12,6 +12,8 @@ import Foundation
 import ImageIO
 
 extension DecodeResolution: ExpressibleByArgument {}
+extension ReferenceGrid: ExpressibleByArgument {}
+extension GuidanceMode: ExpressibleByArgument {}
 
 @main
 struct DiffusionRunner: AsyncParsableCommand {
@@ -21,7 +23,7 @@ struct DiffusionRunner: AsyncParsableCommand {
     )
 
     @Option(help: "Path to model directory containing .aimodel components (or pipeline.json)")
-    var model: String
+    var model: String?
 
     @Option(help: "Text prompt for image generation")
     var prompt: String = "a photo of a cat"
@@ -66,21 +68,64 @@ struct DiffusionRunner: AsyncParsableCommand {
     @Option(help: "VAE decode resolution: full, half, or tiled (default: full)")
     var decodeResolution: DecodeResolution = .full
 
-    @Option(name: .customLong("parity-test"), help: "Path to parity data directory (numpy .npy files)")
+    @Option(
+        help:
+            "img2img reference-token grid, relative to the output grid: full (1:1, ~4096 tokens @1024 / 1024 @512), half (1/4 the tokens), quarter (1/16 the tokens). Only applies with --input-image. Default: full"
+    )
+    var referenceGrid: ReferenceGrid?
+
+    @Option(
+        help:
+            "Whether the pipeline performs classifier-free guidance itself: distilled (one forward pass, no CFG — the model is guidance-distilled and ignores its guidance input) or manual (two passes interpolated by the pipeline using --guidance-scale — stronger text adherence in img2img, ~2× compute per step). --guidance-scale only has an effect with manual. Default: distilled"
+    )
+    var guidanceMode: GuidanceMode?
+
+    @Flag(
+        name: .customLong("clear-coreai-cache"),
+        help: "Clear cached specialization for this model before loading (forces re-specialization)"
+    )
+    var clearCoreAICache: Bool = false
+
+    @Option(
+        name: .customLong("tune-preview"),
+        help:
+            "Phase 1 (collect): record per-step latents and decoded image into <dir> for later fitting. Run once per prompt, then use --tune-fit on the parent directory to fit jointly."
+    )
+    var tunePreviewDir: String?
+
+    @Option(
+        name: .customLong("tune-fit"),
+        help:
+            "Phase 2 (fit): read all collected latent/image pairs from subdirectories of <dir>, fit a single [C, 3] projection jointly, and print the resulting coefficients. No model loading required."
+    )
+    var tuneFitDir: String?
+
+    @Option(
+        name: .customLong("parity-test"),
+        help: ArgumentHelp("Path to parity data directory (numpy .npy files)", visibility: .hidden)
+    )
     var parityTestDir: String?
 
     @Option(
         name: .customLong("trace-inputs"),
-        help: "Path to pipeline trace dir — use Python's noise + embeddings instead of generating")
+        help: ArgumentHelp(
+            "Path to pipeline trace dir — replay Python noise and embeddings instead of generating",
+            visibility: .hidden)
+    )
     var traceInputsDir: String?
 
-    @Flag(
-        name: .customLong("clear-coreai-cache"),
-        help: "Clear Core AI cached specialization for this model before loading (forces re-specialization)"
-    )
-    var clearCoreAICache: Bool = false
-
     func run() async throws {
+        // --tune-fit: fit coefficients from collected pairs, no model needed
+        if let fitDir = tuneFitDir {
+            PreviewTuneHelper.runFit(dir: URL(fileURLWithPath: fitDir))
+            return
+        }
+
+        guard let model else {
+            print("Error: --model is required for generation")
+            throw ExitCode.failure
+        }
+
         let bundleURL = URL(fileURLWithPath: model)
 
         if clearCoreAICache {
@@ -126,6 +171,13 @@ struct DiffusionRunner: AsyncParsableCommand {
             startingCGImage = img
         }
 
+        // --reference-grid only affects the img2img reference-token path; it is
+        // ignored for txt2img. Warn if it was set without an input image.
+        if referenceGrid != nil && startingCGImage == nil {
+            FileHandle.standardError.write(
+                Data("Warning: --reference-grid is ignored without --input-image (txt2img).\n".utf8))
+        }
+
         let config = PipelineConfiguration(
             prompt: prompt,
             negativePrompt: negativePrompt,
@@ -135,6 +187,8 @@ struct DiffusionRunner: AsyncParsableCommand {
             schedulerType: schedulerType,
             startingImage: startingCGImage,
             strength: strength,
+            referenceGrid: referenceGrid ?? .full,
+            guidanceMode: guidanceMode ?? .distilled,
             encoderScaleFactor: resolvedDescriptor.encoderScaleFactor ?? 0.18215,
             decoderScaleFactor: resolvedDescriptor.decoderScaleFactor ?? 0.18215,
             decoderShiftFactor: resolvedDescriptor.decoderShiftFactor ?? 0.0,
@@ -149,9 +203,13 @@ struct DiffusionRunner: AsyncParsableCommand {
             print("Steps: \(effectiveSteps), Guidance: \(effectiveGuidance), Seed: \(seed)")
             print("Image size: \(pipeline.defaultImageSize.width)x\(pipeline.defaultImageSize.height)")
 
+            let tuneHelper = tunePreviewDir.map { PreviewTuneHelper(outputDir: URL(fileURLWithPath: $0)) }
             let start = ContinuousClock.now
 
             let result = try await pipeline.generateImages(configuration: config) { progress in
+                if let tuneHelper {
+                    return tuneHelper.progressHandler(progress)
+                }
                 print("  Step \(progress.step)/\(progress.totalSteps)")
                 return true
             }
@@ -163,6 +221,8 @@ struct DiffusionRunner: AsyncParsableCommand {
                 print("Error: No image generated")
                 throw ExitCode.failure
             }
+
+            if let tuneHelper { tuneHelper.finish(image: image) }
 
             let outputURL = URL(fileURLWithPath: output)
             try saveImage(image, to: outputURL)
@@ -174,9 +234,13 @@ struct DiffusionRunner: AsyncParsableCommand {
             print("Steps: \(effectiveSteps), Guidance: \(effectiveGuidance), Seed: \(seed)")
             print("Image size: \(pipeline.defaultImageSize.width)x\(pipeline.defaultImageSize.height)")
 
+            let tuneHelper = tunePreviewDir.map { PreviewTuneHelper(outputDir: URL(fileURLWithPath: $0)) }
             let start = ContinuousClock.now
 
             let result = try await pipeline.generateImages(configuration: config) { progress in
+                if let tuneHelper {
+                    return tuneHelper.progressHandler(progress)
+                }
                 print("  Step \(progress.step)/\(progress.totalSteps)")
                 return true
             }
@@ -189,6 +253,8 @@ struct DiffusionRunner: AsyncParsableCommand {
                 throw ExitCode.failure
             }
 
+            if let tuneHelper { tuneHelper.finish(image: image) }
+
             let outputURL = URL(fileURLWithPath: output)
             try saveImage(image, to: outputURL)
             print("Saved: \(output)")
@@ -199,9 +265,13 @@ struct DiffusionRunner: AsyncParsableCommand {
             print("Steps: \(effectiveSteps), Guidance: \(effectiveGuidance), Seed: \(seed)")
             print("Image size: \(pipeline.defaultImageSize.width)x\(pipeline.defaultImageSize.height)")
 
+            let tuneHelper = tunePreviewDir.map { PreviewTuneHelper(outputDir: URL(fileURLWithPath: $0)) }
             let start = ContinuousClock.now
 
             let result = try await pipeline.generateImages(configuration: config) { progress in
+                if let tuneHelper {
+                    return tuneHelper.progressHandler(progress)
+                }
                 print("  Step \(progress.step + 1)/\(progress.totalSteps)")
                 return true
             }
@@ -213,6 +283,8 @@ struct DiffusionRunner: AsyncParsableCommand {
                 print("Error: No image generated")
                 throw ExitCode.failure
             }
+
+            if let tuneHelper { tuneHelper.finish(image: image) }
 
             let outputURL = URL(fileURLWithPath: output)
             try saveImage(image, to: outputURL)
@@ -688,64 +760,16 @@ struct DiffusionRunner: AsyncParsableCommand {
 
     // MARK: - Numpy Loader
 
+    /// Shape plus every element widened to `Float`, which is all the comparisons below need.
     struct NpyData {
         let shape: [Int]
         let data: [Float]
     }
 
+    /// Thin adapter over ``CoreAIShared/NpyArray``.
     private func loadNpy(_ url: URL) throws -> NpyData {
-        let raw = try Data(contentsOf: url)
-        // Minimal .npy parser: magic, version, header_len, then FORTRAN header, then data
-        guard raw.count > 10, raw[0] == 0x93, raw[1] == 0x4E else {
-            throw CocoaError(.fileReadCorruptFile)
-        }
-        let version = raw[6]
-        let headerLen: Int
-        let headerStart: Int
-        if version == 1 {
-            headerLen = Int(raw[8]) | (Int(raw[9]) << 8)
-            headerStart = 10
-        } else {
-            headerLen = Int(raw[8]) | (Int(raw[9]) << 8) | (Int(raw[10]) << 16) | (Int(raw[11]) << 24)
-            headerStart = 12
-        }
-        let dataStart = headerStart + headerLen
-        let header = String(data: raw[headerStart..<dataStart], encoding: .ascii) ?? ""
-
-        // Parse shape from header: 'shape': (2, 4, 64, 64)
-        let shape = parseShape(from: header)
-
-        // Parse dtype
-        let isFloat32 = header.contains("f4") || header.contains("float32")
-        let isInt64 = header.contains("i8") || header.contains("int64")
-        let isInt32 = header.contains("i4") || header.contains("int32")
-
-        let elementCount = shape.reduce(1, *)
-        var floats = [Float](repeating: 0, count: elementCount)
-
-        raw.withUnsafeBytes { ptr in
-            let dataPtr = ptr.baseAddress! + dataStart
-            if isFloat32 {
-                let src = dataPtr.assumingMemoryBound(to: Float.self)
-                for i in 0..<elementCount { floats[i] = src[i] }
-            } else if isInt64 {
-                let src = dataPtr.assumingMemoryBound(to: Int64.self)
-                for i in 0..<elementCount { floats[i] = Float(src[i]) }
-            } else if isInt32 {
-                let src = dataPtr.assumingMemoryBound(to: Int32.self)
-                for i in 0..<elementCount { floats[i] = Float(src[i]) }
-            }
-        }
-
-        return NpyData(shape: shape, data: floats)
-    }
-
-    private func parseShape(from header: String) -> [Int] {
-        guard let start = header.range(of: "("),
-            let end = header.range(of: ")", range: start.upperBound..<header.endIndex)
-        else { return [] }
-        let shapeStr = header[start.upperBound..<end.lowerBound]
-        return shapeStr.split(separator: ",").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+        let array = try NpyArray.load(url)
+        return NpyData(shape: array.shape, data: array.asFloat())
     }
 
     // MARK: - Helpers

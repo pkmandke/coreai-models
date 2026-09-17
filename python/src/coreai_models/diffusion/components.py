@@ -21,16 +21,31 @@ import torch
 
 from coreai_models.diffusion.flux2 import (
     Flux2TextEncoderWrapper,
-    Flux2TransformerPrecomputedRoPEWrapper,
+    Flux2TransformerWrapper,
     Flux2VAEDecoderWrapper,
     Flux2VAEEncoderWrapper,
     dummy_flux2_text_encoder,
     dummy_flux2_transformer,
     dummy_flux2_transformer_512,
+    dummy_flux2_transformer_img2img_512_full,
+    dummy_flux2_transformer_img2img_512_half,
+    dummy_flux2_transformer_img2img_512_quarter,
+    dummy_flux2_transformer_img2img_full,
+    dummy_flux2_transformer_img2img_half,
+    dummy_flux2_transformer_img2img_quarter,
     dummy_flux2_vae_decoder,
     dummy_flux2_vae_decoder_half,
     dummy_flux2_vae_encoder,
     dummy_flux2_vae_encoder_half,
+)
+from coreai_models.diffusion.wan import (
+    WanTextEncoderWrapper,
+    WanTransformerWrapper,
+    WanVAEDecoderWrapper,
+    dummy_wan_text_encoder,
+    dummy_wan_transformer,
+    dummy_wan_vae_decoder,
+    wan_transformer_dynamic_shapes,
 )
 
 # ---------------------------------------------------------------------------
@@ -192,6 +207,32 @@ class ComponentSpec:
     wrapper_fn: Callable
     dummy_fn: Callable
     quantizable: bool = False
+    dynamic_shapes_fn: Callable | None = None
+
+
+@dataclass(frozen=True)
+class FunctionVariant:
+    """A single named function variant within a multi-function .aimodel."""
+
+    name: str
+    dummy_fn: Callable
+
+
+@dataclass(frozen=True)
+class MultiFunctionComponentSpec:
+    """A component exported as multiple named functions sharing one set of weights.
+
+    Used when the same model architecture needs different input shapes (e.g.
+    txt2img at 1024×1024 vs 512×512, img2img at various reference resolutions).
+    All functions share weights; disk size equals one copy.
+    """
+
+    asset_name: str
+    input_names: tuple[str, ...]
+    output_names: tuple[str, ...]
+    wrapper_fn: Callable
+    functions: tuple[FunctionVariant, ...]
+    quantizable: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -298,12 +339,57 @@ FLUX2_COMPONENTS: dict[str, ComponentSpec] = {
             "encoder_hidden_states",
             "timestep",
             "guidance",
-            "rotary_emb_cos",
-            "rotary_emb_sin",
+            "img_ids",
+            "txt_ids",
         ),
         output_names=("output",),
-        wrapper_fn=lambda p: Flux2TransformerPrecomputedRoPEWrapper(p.transformer),
+        wrapper_fn=lambda p: Flux2TransformerWrapper(p.transformer),
         dummy_fn=dummy_flux2_transformer,
+        quantizable=True,
+    ),
+    "transformer_img2img_full": ComponentSpec(
+        asset_name="Transformer_img2img_full",
+        input_names=(
+            "hidden_states",
+            "encoder_hidden_states",
+            "timestep",
+            "guidance",
+            "img_ids",
+            "txt_ids",
+        ),
+        output_names=("output",),
+        wrapper_fn=lambda p: Flux2TransformerWrapper(p.transformer),
+        dummy_fn=dummy_flux2_transformer_img2img_full,
+        quantizable=True,
+    ),
+    "transformer_img2img_half": ComponentSpec(
+        asset_name="Transformer_img2img_half",
+        input_names=(
+            "hidden_states",
+            "encoder_hidden_states",
+            "timestep",
+            "guidance",
+            "img_ids",
+            "txt_ids",
+        ),
+        output_names=("output",),
+        wrapper_fn=lambda p: Flux2TransformerWrapper(p.transformer),
+        dummy_fn=dummy_flux2_transformer_img2img_half,
+        quantizable=True,
+    ),
+    "transformer_img2img_quarter": ComponentSpec(
+        asset_name="Transformer_img2img_quarter",
+        input_names=(
+            "hidden_states",
+            "encoder_hidden_states",
+            "timestep",
+            "guidance",
+            "img_ids",
+            "txt_ids",
+        ),
+        output_names=("output",),
+        wrapper_fn=lambda p: Flux2TransformerWrapper(p.transformer),
+        dummy_fn=dummy_flux2_transformer_img2img_quarter,
         quantizable=True,
     ),
     "transformer_512": ComponentSpec(
@@ -313,12 +399,57 @@ FLUX2_COMPONENTS: dict[str, ComponentSpec] = {
             "encoder_hidden_states",
             "timestep",
             "guidance",
-            "rotary_emb_cos",
-            "rotary_emb_sin",
+            "img_ids",
+            "txt_ids",
         ),
         output_names=("output",),
-        wrapper_fn=lambda p: Flux2TransformerPrecomputedRoPEWrapper(p.transformer),
+        wrapper_fn=lambda p: Flux2TransformerWrapper(p.transformer),
         dummy_fn=dummy_flux2_transformer_512,
+        quantizable=True,
+    ),
+    "transformer_512_img2img_full": ComponentSpec(
+        asset_name="Transformer_512_img2img_full",
+        input_names=(
+            "hidden_states",
+            "encoder_hidden_states",
+            "timestep",
+            "guidance",
+            "img_ids",
+            "txt_ids",
+        ),
+        output_names=("output",),
+        wrapper_fn=lambda p: Flux2TransformerWrapper(p.transformer),
+        dummy_fn=dummy_flux2_transformer_img2img_512_full,
+        quantizable=True,
+    ),
+    "transformer_512_img2img_half": ComponentSpec(
+        asset_name="Transformer_512_img2img_half",
+        input_names=(
+            "hidden_states",
+            "encoder_hidden_states",
+            "timestep",
+            "guidance",
+            "img_ids",
+            "txt_ids",
+        ),
+        output_names=("output",),
+        wrapper_fn=lambda p: Flux2TransformerWrapper(p.transformer),
+        dummy_fn=dummy_flux2_transformer_img2img_512_half,
+        quantizable=True,
+    ),
+    "transformer_512_img2img_quarter": ComponentSpec(
+        asset_name="Transformer_512_img2img_quarter",
+        input_names=(
+            "hidden_states",
+            "encoder_hidden_states",
+            "timestep",
+            "guidance",
+            "img_ids",
+            "txt_ids",
+        ),
+        output_names=("output",),
+        wrapper_fn=lambda p: Flux2TransformerWrapper(p.transformer),
+        dummy_fn=dummy_flux2_transformer_img2img_512_quarter,
         quantizable=True,
     ),
     "text_encoder": ComponentSpec(
@@ -362,6 +493,48 @@ FLUX2_COMPONENTS: dict[str, ComponentSpec] = {
 ALL_FLUX2_COMPONENTS: list[str] = list(FLUX2_COMPONENTS.keys())
 
 
+# Multi-function transformer: 8 functions in one .aimodel, shared weights (~2 GB)
+_FLUX2_TRANSFORMER_INPUT_NAMES = (
+    "hidden_states",
+    "encoder_hidden_states",
+    "timestep",
+    "guidance",
+    "img_ids",
+    "txt_ids",
+)
+
+FLUX2_MULTIFUNCTION_TRANSFORMER = MultiFunctionComponentSpec(
+    asset_name="Transformer",
+    input_names=_FLUX2_TRANSFORMER_INPUT_NAMES,
+    output_names=("output",),
+    wrapper_fn=lambda p: Flux2TransformerWrapper(p.transformer),
+    functions=(
+        FunctionVariant("main", dummy_flux2_transformer),
+        FunctionVariant("half", dummy_flux2_transformer_512),
+        FunctionVariant("img2img_quarter", dummy_flux2_transformer_img2img_quarter),
+        FunctionVariant("img2img_half", dummy_flux2_transformer_img2img_half),
+        FunctionVariant("img2img_full", dummy_flux2_transformer_img2img_full),
+        FunctionVariant("img2img_512_quarter", dummy_flux2_transformer_img2img_512_quarter),
+        FunctionVariant("img2img_512_half", dummy_flux2_transformer_img2img_512_half),
+        FunctionVariant("img2img_512_full", dummy_flux2_transformer_img2img_512_full),
+    ),
+    quantizable=True,
+)
+
+# The default (no --single-function): replace the two separate transformer entries
+# with the single multi-function spec.
+FLUX2_MULTIFUNCTION_COMPONENTS: dict[str, ComponentSpec | MultiFunctionComponentSpec] = {
+    "transformer": FLUX2_MULTIFUNCTION_TRANSFORMER,
+    "text_encoder": FLUX2_COMPONENTS["text_encoder"],
+    "vae_decoder": FLUX2_COMPONENTS["vae_decoder"],
+    "vae_decoder_half": FLUX2_COMPONENTS["vae_decoder_half"],
+    "vae_encoder": FLUX2_COMPONENTS["vae_encoder"],
+    "vae_encoder_half": FLUX2_COMPONENTS["vae_encoder_half"],
+}
+
+ALL_FLUX2_MULTIFUNCTION_COMPONENTS: list[str] = list(FLUX2_MULTIFUNCTION_COMPONENTS.keys())
+
+
 SD3_COMPONENTS: dict[str, ComponentSpec] = {
     "text_encoder": ComponentSpec(
         asset_name="TextEncoder",
@@ -398,29 +571,73 @@ SD3_COMPONENTS: dict[str, ComponentSpec] = {
 
 ALL_SD3_COMPONENTS: list[str] = list(SD3_COMPONENTS.keys())
 
+WAN_COMPONENTS: dict[str, ComponentSpec] = {
+    "transformer": ComponentSpec(
+        asset_name="Transformer",
+        input_names=(
+            "hidden_states",
+            "encoder_hidden_states",
+            "timestep",
+        ),
+        output_names=("output",),
+        wrapper_fn=lambda p: WanTransformerWrapper(p.transformer),
+        dummy_fn=dummy_wan_transformer,
+        quantizable=True,
+        dynamic_shapes_fn=wan_transformer_dynamic_shapes,
+    ),
+    "text_encoder": ComponentSpec(
+        asset_name="TextEncoder",
+        input_names=("input_ids", "attention_mask"),
+        output_names=("hidden_states",),
+        wrapper_fn=lambda p: WanTextEncoderWrapper(p.text_encoder),
+        dummy_fn=dummy_wan_text_encoder,
+        quantizable=True,
+    ),
+    "vae_decoder": ComponentSpec(
+        asset_name="VAEDecoder",
+        input_names=("latent",),
+        output_names=("pixels",),
+        wrapper_fn=lambda p: WanVAEDecoderWrapper(p.vae),
+        dummy_fn=dummy_wan_vae_decoder,
+    ),
+}
+
+ALL_WAN_COMPONENTS: list[str] = list(WAN_COMPONENTS.keys())
+
 
 def get_component_registry(
     hf_pipe: Any,
     pipeline_type: str = "sd",
-) -> dict[str, ComponentSpec]:
+    multifunction: bool = False,
+) -> dict[str, ComponentSpec | MultiFunctionComponentSpec]:
     """Return the component registry for the given pipeline type.
 
     Args:
         hf_pipe: The loaded HuggingFace pipeline (unused for routing, but
             available for future introspection).
         pipeline_type: One of "sd", "sd3", or "flux2".
+        multifunction: If True, use multi-function export for FLUX.2 transformer
+            (5 functions in one .aimodel: main, half, img2img_quarter/half/full).
     """
     if pipeline_type == "flux2":
+        if multifunction:
+            return FLUX2_MULTIFUNCTION_COMPONENTS
         return FLUX2_COMPONENTS
     if pipeline_type == "sd3":
         return SD3_COMPONENTS
+    if pipeline_type == "wan":
+        return WAN_COMPONENTS
     return SD_COMPONENTS
 
 
-def get_valid_components(pipeline_type: str) -> list[str]:
+def get_valid_components(pipeline_type: str, multifunction: bool = False) -> list[str]:
     """Return valid component names for a given pipeline type."""
     if pipeline_type == "flux2":
+        if multifunction:
+            return ALL_FLUX2_MULTIFUNCTION_COMPONENTS
         return ALL_FLUX2_COMPONENTS
     if pipeline_type == "sd3":
         return ALL_SD3_COMPONENTS
+    if pipeline_type == "wan":
+        return ALL_WAN_COMPONENTS
     return ALL_SD_COMPONENTS

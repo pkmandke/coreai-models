@@ -58,6 +58,11 @@ class Attention(nn.Module):
         rope_scaling = getattr(config, "rope_scaling", None)
         original_max_pos = getattr(config, "original_max_position_embeddings", None)
         native_max_pos = getattr(config, "_native_max_position_embeddings", max_pos)
+        # For partial rotary (e.g. Phi-4-mini, partial_rotary_factor=0.75) the
+        # runtime composite RoPE op rejects freqs.count != head_dim/2 on newer OS
+        # betas and falls back to a slow CPU scalar path. Request the decomposed
+        # (raw torch ops) path, which initialize_rope builds while preserving any
+        # LongRoPE scaling, so accuracy is unchanged.
         self.rope = initialize_rope(
             dims=rope_dims,
             base=rope_theta,
@@ -65,6 +70,7 @@ class Attention(nn.Module):
             max_position_embeddings=max_pos or original_max_pos,
             original_max_position_embeddings=original_max_pos,
             config_max_position_embeddings=native_max_pos,
+            decomposed=partial_rotary_factor < 1.0,
         )
 
     def forward(
@@ -185,6 +191,9 @@ class Phi3Model(nn.Module):
 class Phi3ForCausalLM(BaseForCausalLM):
     _HF_MODEL_CLASS = HFPhi3ForCausalLM
 
+    # Emit a second, prefill-only ``prefill`` entrypoint beside ``main``.
+    exports_prefill_graph = True
+
     @classmethod
     @override
     def _get_reauthored_config(cls, hf_config, max_context_length=None, num_layers=None):
@@ -208,9 +217,14 @@ class Phi3ForCausalLM(BaseForCausalLM):
         position_ids: torch.IntTensor,
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple:
         cache = KVCache(k_cache, v_cache)
         out = self.model(input_ids, position_ids, cache)
+        if self.prefill_mode:
+            # A bare `return` causes torch export to trace a leaf node with value
+            # `None` rather than having no leaf nodes whatsoever. Remedied with
+            # empty tuple.
+            return ()
         return self.lm_head(out)
 
     @override

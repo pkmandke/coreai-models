@@ -26,7 +26,11 @@ from coreai_models.export.presets import (
     DEFAULT_IOS_COMPRESSION_PRESET as IOS_DEFAULT,
 )
 from coreai_models.export.presets import DEFAULT_MACOS_COMPRESSION_PRESET as MACOS_DEFAULT
-from coreai_models.model_registry import try_lookup_preset, try_lookup_preset_by_hf_id
+from coreai_models.model_registry import (
+    presets_for_type,
+    try_lookup_preset,
+    try_lookup_preset_by_hf_id,
+)
 from coreai_models.models.registry import list_models as list_llm_models
 
 
@@ -84,6 +88,14 @@ def build_parser() -> argparse.ArgumentParser:
             "or 'quantization_config' (macOS). See models/<family>/ in the source tree for "
             "shipped recipes. Mutually exclusive with --compression."
         ),
+    )
+    parser.add_argument(
+        "--quantization-mode",
+        choices=["eager", "graph"],
+        default=None,
+        help="Override the coreai-opt execution mode for pre-export torch quantization "
+        "(macOS only). Defaults to whatever the compression preset or YAML sets. "
+        "'graph' externalizes composite ops and disables mmap-backed finalization.",
     )
     parser.add_argument(
         "--max-context-length",
@@ -174,6 +186,14 @@ def build_parser() -> argparse.ArgumentParser:
             "iOS only. Skip int8 quantization of the embedding table and keep it in "
             "float32. Default: False (embedding is quantized). Rejected when "
             "--platform is macOS."
+        ),
+    )
+    parser.add_argument(
+        "--with-drafter",
+        action="store_true",
+        help=(
+            "Export the drafter model alongside the target for speculative decoding. "
+            "The drafter is looked up from the model registry; not all models have one."
         ),
     )
     return parser
@@ -351,6 +371,9 @@ def _resolve_export_config(args: argparse.Namespace) -> ExportConfig:
             f"--disable-embedding-quantization-ios requires --platform iOS (got '{variant}')."
         )
 
+    if args.quantization_mode == "graph" and variant != "macOS":
+        raise SystemExit(f"--quantization-mode graph requires --platform macOS (got '{variant}').")
+
     if args.compression_config is not None:
         if not args.compression_config.is_file():
             raise SystemExit(f"--compression-config: file not found: {args.compression_config}")
@@ -395,11 +418,14 @@ def _resolve_export_config(args: argparse.Namespace) -> ExportConfig:
         output_name=args.output_name,
         num_layers=args.num_layers,
         overwrite=args.overwrite,
+        quantization_mode=args.quantization_mode,
         compression_config_object=compression_config_object,
         disable_embedding_quantization=args.disable_embedding_quantization_ios,
         palettization_num_workers=palettization_num_workers,
         ios_memory_efficient=args.ios_memory_efficient,
         include_debug_info=args.include_debug_info,
+        model_type_override=getattr(preset, "_model_type_override", None) if preset else None,
+        with_drafter=args.with_drafter,
     )
 
 
@@ -433,7 +459,13 @@ def main() -> None:
         return
 
     if args.list_models:
-        print("LLM model types:")
+        print("LLM presets (use short name or HuggingFace ID):")
+        print()
+        for p in presets_for_type("llm"):
+            platform = p.variant or "macOS"
+            print(f"  {p.short_name:35s} {p.hf_id:45s} {platform}")
+        print()
+        print("Supported architectures:")
         print()
         for name in list_llm_models():
             print(f"  {name}")
@@ -454,6 +486,8 @@ def main() -> None:
         print(f"  model:              {config.hf_model_id}")
         print(f"  platform:           {config.variant}")
         print(f"  compression:        {config.compression}")
+        if config.quantization_mode is not None:
+            print(f"  quantization_mode:  {config.quantization_mode}")
         print(f"  compute_precision:  {config.compute_precision}")
         if config.max_context_length:
             print(f"  max_context_length: {config.max_context_length}")
@@ -464,6 +498,8 @@ def main() -> None:
             print(f"  num_layers:         {config.num_layers}")
         print(f"  overwrite:          {config.overwrite}")
         print(f"  include_debug_info: {config.include_debug_info}")
+        if config.with_drafter:
+            print("  with_drafter:       True")
         if config.variant == "iOS":
             print(f"  disable_embedding_quantization: {config.disable_embedding_quantization}")
             print(f"  palettization_num_workers: {config.palettization_num_workers}")
